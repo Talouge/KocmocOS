@@ -1,0 +1,110 @@
+name: Build Kocmoc OS ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_work:
+        description: Keep the mkarchiso work directory for debugging
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'iso/**'
+      - 'desktop/**'
+      - 'shell/**'
+      - 'settings/**'
+      - 'app-store/**'
+      - 'update-center/**'
+      - 'installer/**'
+      - 'greeter/**'
+      - 'panel/**'
+      - 'themes/**'
+      - 'icons/**'
+      - 'wallpapers/**'
+      - 'applications/**'
+      - 'scripts/**'
+      - 'build.sh'
+      - '.github/workflows/build-iso.yml'
+
+permissions:
+  contents: read
+
+env:
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  SOURCE_DATE_EPOCH: '0'
+
+jobs:
+  static-check:
+    name: Static checks
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install check dependencies
+        run: pacman -Sy --noconfirm --needed bash python
+      - name: Run project checks
+        run: scripts/check.sh
+
+  build-iso:
+    name: Build ISO
+    needs: static-check
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore pacman cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/pacman/pkg
+            /var/lib/pacman/sync
+          key: arch-pacman-${{ hashFiles('iso/packages.x86_64', 'iso/pacman.conf') }}
+          restore-keys: |
+            arch-pacman-
+
+      - name: Install Arch build dependencies
+        run: pacman -Syy --noconfirm --needed archiso python rsync
+
+      - name: Build Kocmoc OS ISO
+        env:
+          KEEP_WORK: ${{ inputs.keep_work }}
+        run: |
+          if [[ "$KEEP_WORK" == "true" ]]; then
+            ./build.sh --keep-work
+          else
+            ./build.sh
+          fi
+
+      - name: Verify ISO artifact
+        run: |
+          test -s Kocmoc-OS-x86_64.iso
+          test -s Kocmoc-OS-x86_64.iso.sha256
+          sha256sum --check Kocmoc-OS-x86_64.iso.sha256
+          file Kocmoc-OS-x86_64.iso
+          du -h Kocmoc-OS-x86_64.iso
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kocmoc-OS-x86_64
+          path: |
+            Kocmoc-OS-x86_64.iso
+            Kocmoc-OS-x86_64.iso.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kocmoc-build-debug
+          path: build/
+          if-no-files-found: ignore
+          retention-days: 7

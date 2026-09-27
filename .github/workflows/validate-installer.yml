@@ -1,0 +1,29 @@
+name: Validate installer sources
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validation dependencies
+        run: pacman -Sy --noconfirm --needed bash python
+      - name: Validate source tree
+        run: scripts/check.sh
+      - name: Validate staging layout
+        run: |
+          rm -rf /tmp/kocmoc-stage
+          mkdir -p /tmp/kocmoc-stage
+          scripts/stage.sh . /tmp/kocmoc-stage
+          scripts/enable-services.sh /tmp/kocmoc-stage
+          test -x /tmp/kocmoc-stage/usr/bin/kocmoc-installer
+          test -x /tmp/kocmoc-stage/usr/lib/kocmoc/kocmoc-install-backend
+          test -f /tmp/kocmoc-stage/etc/greetd/kocmoc.toml
+          test -L /tmp/kocmoc-stage/etc/systemd/system/display-manager.service

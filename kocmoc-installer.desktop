@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+# Kocmoc OS archiso profile. Sourced by mkarchiso.
+iso_name="kocmoc-os"
+iso_label="KOCMOC_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"
+iso_publisher="Kocmoc OS Project"
+iso_application="Kocmoc OS Live / Installer"
+iso_version="0.1.0"
+install_dir="kocmoc"
+buildmodes=('iso')
+# UEFI-only, x86_64. Newer archiso uses the unified 'uefi.systemd-boot' mode,
+# older releases only know the split esp/eltorito modes.
+if grep -q 'uefi\.systemd-boot)' /usr/bin/mkarchiso 2>/dev/null; then
+  bootmodes=('uefi.systemd-boot')
+else
+  bootmodes=('uefi-x64.systemd-boot.esp' 'uefi-x64.systemd-boot.eltorito')
+fi
+arch="x86_64"
+pacman_conf="pacman.conf"
+airootfs_image_type="squashfs"
+airootfs_image_tool_options=('-comp' 'xz' '-Xbcj' 'x86' '-b' '1M' '-Xdict-size' '1M')
+file_permissions=()
+# build.sh appends generated file_permissions entries for executables below.

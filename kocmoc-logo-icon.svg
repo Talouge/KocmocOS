@@ -1,0 +1,147 @@
+"""Thin, honest wrapper around pacman / checkupdates / AUR RPC.
+
+Reads use an unprivileged, freshly synced copy of the sync databases
+(checkupdates' private dbpath). Writes go through kocmoc-helper via pkexec,
+which runs real pacman transactions. Arch does not support partial upgrades,
+so installing a package also applies pending updates (pacman -Syu --needed).
+"""
+import json
+import os
+import re
+import subprocess
+import urllib.parse
+import urllib.request
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "kocmoc")
+DBPATH = os.path.join(CACHE, "pacman-db")
+HELPER = ["pkexec", "/usr/lib/kocmoc/kocmoc-helper"]
+NAME_RE = re.compile(r"^[a-z0-9@._+-]+$")
+PROGRESS_RE = re.compile(r"^\(\s*(\d+)/(\d+)\)\s+(.*)$")
+REBOOT_PKGS = {"linux", "linux-lts", "linux-zen", "linux-firmware", "systemd", "glibc", "mesa",
+               "nvidia", "nvidia-open", "amd-ucode", "intel-ucode"}
+
+
+def _run(cmd, env=None, timeout=120):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]} timed out"
+
+
+def _db():
+    return ["--dbpath", DBPATH] if os.path.isdir(os.path.join(DBPATH, "sync")) else []
+
+
+def refresh():
+    """Sync the private db. Returns (ok, [updates], error_text)."""
+    os.makedirs(CACHE, exist_ok=True)
+    env = dict(os.environ, CHECKUPDATES_DB=DBPATH, LC_ALL="C")
+    rc, out, err = _run(["checkupdates"], env=env, timeout=300)
+    if rc in (0, 2):
+        return True, parse_updates(out), ""
+    return False, [], (err or out or "checkupdates failed").strip()
+
+
+def parse_updates(text):
+    ups = []
+    for line in text.splitlines():
+        m = re.match(r"^(\S+)\s+(\S+)\s+->\s+(\S+)", line)
+        if m:
+            ups.append({"name": m.group(1), "old": m.group(2), "new": m.group(3)})
+    return ups
+
+
+def search(query):
+    rc, out, _ = _run(["pacman", "-Ss", *_db(), "--", query], env=dict(os.environ, LC_ALL="C"))
+    results, cur = [], None
+    for line in out.splitlines():
+        if line.startswith("    "):
+            if cur is not None:
+                cur["desc"] = line.strip()
+            continue
+        m = re.match(r"^(\S+)/(\S+)\s+(\S+)(.*)$", line)
+        if m:
+            cur = {"repo": m.group(1), "name": m.group(2), "version": m.group(3),
+                   "installed": "[installed" in m.group(4), "desc": "", "source": "repo"}
+            results.append(cur)
+    q = query.lower()
+    results.sort(key=lambda r: (r["name"] != q, not r["name"].startswith(q), r["name"]))
+    return results
+
+
+def _parse_info(text):
+    info, key = {}, None
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z][A-Za-z ]+?)\s*:\s(.*)$", line)
+        if m:
+            key = m.group(1).strip()
+            info[key] = m.group(2).strip()
+        elif key and line.startswith(" "):
+            info[key] += " " + line.strip()
+    return info
+
+
+def info(name):
+    """Repository info (+local version). {} if unknown."""
+    rc, out, _ = _run(["pacman", "-Si", *_db(), "--", name], env=dict(os.environ, LC_ALL="C"))
+    data = _parse_info(out) if rc == 0 else {}
+    local = local_version(name)
+    if not data and local:
+        rc, out, _ = _run(["pacman", "-Qi", "--", name], env=dict(os.environ, LC_ALL="C"))
+        data = _parse_info(out)
+        data.setdefault("Repository", "local")
+    if data:
+        data["_local"] = local
+    return data
+
+
+def local_version(name):
+    rc, out, _ = _run(["pacman", "-Q", "--", name])
+    return out.split()[1] if rc == 0 and len(out.split()) >= 2 else None
+
+
+def installed_explicit():
+    rc, out, _ = _run(["pacman", "-Qe"])
+    return [{"name": n, "version": v, "installed": True, "repo": "local", "desc": "", "source": "repo"}
+            for n, v in (l.split()[:2] for l in out.splitlines() if len(l.split()) >= 2)]
+
+
+def desktop_files(name):
+    rc, out, _ = _run(["pacman", "-Qlq", "--", name])
+    return [l for l in out.splitlines()
+            if l.startswith("/usr/share/applications/") and l.endswith(".desktop")]
+
+
+def aur_search(query):
+    url = ("https://aur.archlinux.org/rpc/v5/search/" + urllib.parse.quote(query)
+           + "?by=name-desc")
+    with urllib.request.urlopen(url, timeout=15) as r:
+        data = json.load(r)
+    res = []
+    for p in sorted(data.get("results", []), key=lambda x: -(x.get("Popularity") or 0))[:80]:
+        res.append({"name": p["Name"], "version": p["Version"], "desc": p.get("Description") or "",
+                    "repo": "aur", "source": "aur", "votes": p.get("NumVotes", 0),
+                    "maintainer": p.get("Maintainer") or "orphaned",
+                    "outdated": bool(p.get("OutOfDate")), "url": p.get("URL") or "",
+                    "installed": local_version(p["Name"]) is not None})
+    return res
+
+
+def install_cmd(names):
+    return HELPER + ["pkg-install", *names]
+
+
+def remove_cmd(names):
+    return HELPER + ["pkg-remove", *names]
+
+
+def upgrade_cmd():
+    return HELPER + ["sys-upgrade"]
+
+
+def explain_rc(rc):
+    return {126: "Authentication was cancelled.",
+            127: "Not authorized (or a required tool is missing)."}.get(rc)

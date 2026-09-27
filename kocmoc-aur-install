@@ -1,0 +1,31 @@
+# Kocmoc application menu
+[main]
+font=Inter:size=11
+terminal=foot -e
+prompt="  ›  "
+placeholder=Search apps
+icon-theme=Papirus-Dark
+anchor=bottom-left
+x-margin=8
+y-margin=56
+width=36
+lines=10
+horizontal-pad=18
+vertical-pad=16
+inner-pad=10
+line-height=26
+layer=overlay
+[colors]
+background=121212f5
+text=b8b8b8ff
+prompt=7a7a7aff
+placeholder=5a5a5aff
+input=ffffffff
+match=ffffffff
+selection=262626ff
+selection-text=ffffffff
+selection-match=ffffffff
+border=2c2c2cff
+[border]
+width=1
+radius=16

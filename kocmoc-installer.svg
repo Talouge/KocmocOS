@@ -1,0 +1,177 @@
+"""User settings for the Kocmoc shell and the labwc config generator.
+
+Settings live in ~/.config/kocmoc/settings.json. The effective labwc config is
+rendered into ~/.cache/kocmoc/labwc from the system defaults in
+/etc/xdg/kocmoc/labwc, so system updates to defaults still reach users.
+"""
+import copy
+import json
+import os
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "kocmoc")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "kocmoc")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+DISPLAY_FILE = os.path.join(CONFIG_DIR, "display.json")
+SYSTEM_LABWC = os.environ.get("KOCMOC_LABWC_DEFAULTS", "/etc/xdg/kocmoc/labwc")
+LABWC_DIR = os.path.join(CACHE_DIR, "labwc")
+
+DEFAULTS = {
+    "appearance": {"wallpaper": "/usr/share/backgrounds/kocmoc/kocmoc-orbit.png",
+                   "icon_theme": "Papirus-Dark", "animations": True},
+    "clock": {"24h": True},
+    "keyboard": {"layouts": "us", "options": "grp:alt_shift_toggle",
+                 "repeat_rate": 25, "repeat_delay": 600},
+    "mouse": {"speed": 0.0, "natural": False, "left_handed": False},
+    "touchpad": {"speed": 0.0, "natural": True, "tap": True, "dwt": True},
+    "power": {"lock_after": 10, "suspend_after": 0},
+    "privacy": {"recent_files": True},
+}
+
+
+def _merge(base, over):
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load():
+    return _merge(DEFAULTS, _read_json(SETTINGS_FILE))
+
+
+def save(settings):
+    _write_json(SETTINGS_FILE, settings)
+
+
+def load_display():
+    return _read_json(DISPLAY_FILE)
+
+
+def save_display(data):
+    _write_json(DISPLAY_FILE, data)
+
+
+def randr_args(name, st):
+    cmd = ["wlr-randr", "--output", name]
+    if not st.get("enabled", True):
+        return cmd + ["--off"]
+    cmd.append("--on")
+    if st.get("mode"):
+        cmd += ["--mode", st["mode"]]
+    if st.get("scale"):
+        cmd += ["--scale", str(st["scale"])]
+    if st.get("transform"):
+        cmd += ["--transform", st["transform"]]
+    return cmd
+
+
+def user_overrides_labwc():
+    return os.path.exists(os.path.join(HOME, ".config", "labwc", "rc.xml"))
+
+
+def _yn(v):
+    return "yes" if v else "no"
+
+
+def _set(parent, tag, text):
+    el = parent.find(tag)
+    if el is None:
+        el = ET.SubElement(parent, tag)
+    el.text = str(text)
+
+
+def render_labwc(settings=None, src=SYSTEM_LABWC, dst=LABWC_DIR):
+    s = settings or load()
+    os.makedirs(dst, exist_ok=True)
+    for name in os.listdir(src):
+        p = os.path.join(src, name)
+        if os.path.isfile(p):
+            shutil.copyfile(p, os.path.join(dst, name))
+
+    tree = ET.parse(os.path.join(src, "rc.xml"))
+    root = tree.getroot()
+    kb = root.find("keyboard")
+    if kb is None:
+        kb = ET.SubElement(root, "keyboard")
+    _set(kb, "repeatRate", int(s["keyboard"]["repeat_rate"]))
+    _set(kb, "repeatDelay", int(s["keyboard"]["repeat_delay"]))
+    li = root.find("libinput")
+    if li is None:
+        li = ET.SubElement(root, "libinput")
+    for category, key in (("default", "mouse"), ("touchpad", "touchpad")):
+        dev = li.find(f"device[@category='{category}']")
+        if dev is None:
+            dev = ET.SubElement(li, "device", {"category": category})
+        v = s[key]
+        _set(dev, "pointerSpeed", round(float(v["speed"]), 2))
+        _set(dev, "naturalScroll", _yn(v["natural"]))
+        if key == "mouse":
+            _set(dev, "leftHanded", _yn(v["left_handed"]))
+        else:
+            _set(dev, "tap", _yn(v["tap"]))
+            _set(dev, "disableWhileTyping", _yn(v["dwt"]))
+    tree.write(os.path.join(dst, "rc.xml"), encoding="unicode", xml_declaration=True)
+
+    env_lines = []
+    try:
+        with open(os.path.join(src, "environment")) as f:
+            env_lines = [l.rstrip("\n") for l in f
+                         if not l.startswith(("XKB_DEFAULT_LAYOUT=", "XKB_DEFAULT_OPTIONS="))]
+    except OSError:
+        pass
+    env_lines.append(f"XKB_DEFAULT_LAYOUT={s['keyboard']['layouts']}")
+    if s["keyboard"].get("options"):
+        env_lines.append(f"XKB_DEFAULT_OPTIONS={s['keyboard']['options']}")
+    with open(os.path.join(dst, "environment"), "w") as f:
+        f.write("\n".join(env_lines) + "\n")
+    return dst
+
+
+def apply_labwc(settings=None):
+    """Render and ask the running compositor to reload. Returns a note or None."""
+    render_labwc(settings)
+    if user_overrides_labwc():
+        return "You maintain ~/.config/labwc yourself, so Kocmoc settings are not applied there."
+    subprocess.run(["labwc", "--reconfigure"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return None
+
+
+def write_gtk_settings(settings=None):
+    s = settings or load()
+    ini = ("[Settings]\n"
+           "gtk-application-prefer-dark-theme=1\n"
+           f"gtk-icon-theme-name={s['appearance']['icon_theme']}\n"
+           "gtk-font-name=Inter 10\n"
+           "gtk-cursor-theme-name=Adwaita\n"
+           f"gtk-enable-animations={1 if s['appearance']['animations'] else 0}\n"
+           f"gtk-recent-files-enabled={1 if s['privacy']['recent_files'] else 0}\n")
+    base = os.path.join(HOME, ".config")
+    for ver, extra in (("gtk-3.0", "gtk-theme-name=Adwaita-dark\n"), ("gtk-4.0", "")):
+        d = os.path.join(base, ver)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "settings.ini"), "w") as f:
+            f.write(ini + extra)

@@ -1,0 +1,115 @@
+"""NetworkManager helpers. Wi-Fi secrets go over D-Bus, never on a command line."""
+import re
+import subprocess
+
+from gi.repository import Gio, GLib
+
+NM = "org.freedesktop.NetworkManager"
+NM_PATH = "/org/freedesktop/NetworkManager"
+
+
+def split_terse(line):
+    parts = re.split(r"(?<!\\):", line)
+    return [p.replace("\\:", ":").replace("\\\\", "\\") for p in parts]
+
+
+def nmcli(*args, timeout=20):
+    try:
+        p = subprocess.run(["nmcli", *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def wifi_enabled():
+    rc, out, _ = nmcli("-t", "radio", "wifi")
+    return out.strip() == "enabled"
+
+
+def set_wifi(on):
+    return nmcli("radio", "wifi", "on" if on else "off")
+
+
+def wifi_device():
+    rc, out, _ = nmcli("-t", "-f", "DEVICE,TYPE", "device")
+    for line in out.splitlines():
+        dev, typ = (split_terse(line) + ["", ""])[:2]
+        if typ == "wifi":
+            return dev
+    return None
+
+
+def networks(rescan=False):
+    rc, out, err = nmcli("-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list",
+                         "--rescan", "yes" if rescan else "auto", timeout=30)
+    seen, res = {}, []
+    for line in out.splitlines():
+        f = split_terse(line)
+        if len(f) < 4 or not f[1]:
+            continue
+        item = {"active": f[0] == "*", "ssid": f[1], "signal": int(f[2] or 0),
+                "security": "" if f[3] in ("", "--") else f[3]}
+        if item["ssid"] in seen:
+            prev = seen[item["ssid"]]
+            prev["active"] |= item["active"]
+            prev["signal"] = max(prev["signal"], item["signal"])
+            continue
+        seen[item["ssid"]] = item
+        res.append(item)
+    res.sort(key=lambda n: (not n["active"], -n["signal"]))
+    return res
+
+
+def saved_connections():
+    rc, out, _ = nmcli("-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show")
+    res = []
+    for line in out.splitlines():
+        f = split_terse(line)
+        if len(f) >= 4:
+            res.append({"name": f[0], "uuid": f[1], "type": f[2], "device": f[3]})
+    return res
+
+
+def connect(ssid, security="", password=None):
+    """Activate a saved profile or create one via D-Bus. Returns error text or None."""
+    for c in saved_connections():
+        if c["name"] == ssid and c["type"] in ("802-11-wireless", "wifi"):
+            rc, out, err = nmcli("connection", "up", "uuid", c["uuid"], timeout=60)
+            return None if rc == 0 else (err or out).strip()
+    iface = wifi_device()
+    if not iface:
+        return "No Wi-Fi adapter found."
+    if "802.1X" in security:
+        return "Enterprise (802.1X) networks are not supported by this dialog yet. Use `nmtui` in the terminal."
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        dev = bus.call_sync(NM, NM_PATH, NM, "GetDeviceByIpIface", GLib.Variant("(s)", (iface,)),
+                            GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+        settings = {
+            "connection": {"id": GLib.Variant("s", ssid), "type": GLib.Variant("s", "802-11-wireless")},
+            "802-11-wireless": {"ssid": GLib.Variant("ay", ssid.encode()),
+                                "mode": GLib.Variant("s", "infrastructure")},
+        }
+        if security:
+            mgmt = "sae" if ("WPA3" in security and "WPA2" not in security) else "wpa-psk"
+            if "WEP" in security:
+                return "WEP networks are insecure and not supported."
+            settings["802-11-wireless-security"] = {"key-mgmt": GLib.Variant("s", mgmt),
+                                                    "psk": GLib.Variant("s", password or "")}
+        bus.call_sync(NM, NM_PATH, NM, "AddAndActivateConnection",
+                      GLib.Variant("(a{sa{sv}}oo)", (settings, dev, "/")),
+                      GLib.VariantType("(oo)"), Gio.DBusCallFlags.NONE, 60000, None)
+        return None
+    except GLib.Error as e:
+        return e.message
+
+
+def disconnect():
+    dev = wifi_device()
+    if dev:
+        nmcli("device", "disconnect", dev)
+
+
+def connectivity():
+    rc, out, _ = nmcli("-t", "networking", "connectivity")
+    return out.strip() or "unknown"

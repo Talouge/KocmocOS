@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Install Kocmoc OS
+Comment=Install Kocmoc OS to this computer
+Exec=kocmoc-installer
+Icon=kocmoc-installer
+Type=Application
+Categories=System;

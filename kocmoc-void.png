@@ -1,0 +1,1171 @@
+#!/usr/bin/env python3
+"""Kocmoc Settings: configures the real system (NetworkManager, BlueZ, PipeWire,
+labwc/libinput, systemd, polkit-guarded helpers). No mock toggles: every control
+calls the underlying tool, and anything that fails is reported on the page."""
+import glob
+import grp
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.environ.get("KOCMOC_LIB"), "/usr/lib/kocmoc", os.path.join(_here, "..", "shell")):
+    if _p and os.path.isdir(os.path.join(_p, "kocmoc")):
+        sys.path.insert(0, _p)
+        break
+
+from kocmoc import VERSION, config, disks, net, pkg, proc, theme  # noqa: E402
+from kocmoc.theme import (Gio, GLib, Gtk, button, clear, dropdown, group, hbox, label,  # noqa: E402
+                          row, searchable_dropdown, vbox)
+
+HELPER = pkg.HELPER
+
+
+def openssl_hash(password):
+    rc, out = proc.run(["openssl", "passwd", "-6", "-stdin"], input=password + "\n")
+    return out.strip() if rc == 0 else None
+
+
+class Page:
+    title = ""
+    subtitle = None
+
+    def __init__(self, win):
+        self.win = win
+        self.widget, self.body = theme.page(self.title, self.subtitle)
+        self.status = label("", "status small", wrap=True)
+        self.body.append(self.status)
+        self._loading = False
+        self.build()
+
+    def build(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def hide(self):
+        pass
+
+    def say(self, text):
+        self.status.set_text(text or "")
+
+    def run(self, cmd, done=None, input=None, ok=None, timeout=300):
+        def finished(res):
+            if isinstance(res, Exception):
+                self.say(f"Error: {res}")
+                return
+            rc, out = res
+            if rc != 0:
+                self.say(pkg.explain_rc(rc) or f"Failed: {out.strip()[-500:] or rc}")
+            elif ok:
+                self.say(ok)
+            if done:
+                done(rc, out)
+        proc.in_thread(lambda: proc.run(cmd, input=input, timeout=timeout), finished)
+
+
+# --------------------------------------------------------------------------- Appearance
+class AppearancePage(Page):
+    title = "Appearance"
+    subtitle = "Wallpaper, icons and motion."
+    WALLS = "/usr/share/backgrounds/kocmoc"
+    ICONS = ["Papirus-Dark", "Papirus", "Adwaita"]
+
+    def build(self):
+        g, card = group("Wallpaper")
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
+                                column_spacing=12, row_spacing=12, homogeneous=True)
+        self.flow.add_css_class("pad")
+        card.append(self.flow)
+        card.append(row("Custom image", "Any PNG or JPEG file", button("Choose…", self.choose)))
+        self.body.append(g)
+        g, card = group("Style")
+        self.icon_dd = dropdown(self.ICONS)
+        self.anim = Gtk.Switch()
+        card.append(row("Icon theme", None, self.icon_dd))
+        card.append(row("Animations", "Transitions inside applications", self.anim))
+        self.body.append(g)
+        self.icon_dd.connect("notify::selected", self.on_style)
+        self.anim.connect("notify::active", self.on_style)
+
+    def refresh(self):
+        self._loading = True
+        s = config.load()
+        clear(self.flow)
+        for path in sorted(glob.glob(os.path.join(self.WALLS, "*.png")) + glob.glob(os.path.join(self.WALLS, "*.jpg"))):
+            pic = Gtk.Picture.new_for_filename(path)
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_size_request(190, 107)
+            b = Gtk.Button()
+            b.set_child(pic)
+            b.add_css_class("wall")
+            if path == s["appearance"]["wallpaper"]:
+                b.add_css_class("selected")
+            b.connect("clicked", lambda _b, p=path: self.set_wall(p))
+            self.flow.append(b)
+        icon = s["appearance"]["icon_theme"]
+        self.icon_dd.set_selected(self.ICONS.index(icon) if icon in self.ICONS else 0)
+        self.anim.set_active(bool(s["appearance"]["animations"]))
+        self._loading = False
+
+    def set_wall(self, path):
+        s = config.load()
+        s["appearance"]["wallpaper"] = path
+        config.save(s)
+        proc.spawn(["kocmoc-wallpaper"])
+        self.refresh()
+        self.say("Wallpaper updated.")
+
+    def choose(self):
+        dlg = Gtk.FileDialog(title="Choose wallpaper")
+        flt = Gtk.FileFilter(name="Images")
+        for m in ("image/png", "image/jpeg", "image/webp"):
+            flt.add_mime_type(m)
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(flt)
+        dlg.set_filters(store)
+        dlg.open(self.win, None, self._chosen)
+
+    def _chosen(self, dlg, res):
+        try:
+            f = dlg.open_finish(res)
+        except GLib.Error:
+            return
+        if f and f.get_path():
+            self.set_wall(f.get_path())
+
+    def on_style(self, *_):
+        if self._loading:
+            return
+        s = config.load()
+        s["appearance"]["icon_theme"] = self.ICONS[self.icon_dd.get_selected()]
+        s["appearance"]["animations"] = self.anim.get_active()
+        config.save(s)
+        config.write_gtk_settings(s)
+        self.say("Saved. Applications pick this up when they are restarted.")
+
+
+# --------------------------------------------------------------------------- Display
+class DisplayPage(Page):
+    title = "Display"
+    subtitle = "Resolution, refresh rate, scaling and rotation for each monitor."
+    SCALES = ["1", "1.25", "1.5", "1.75", "2"]
+    ROTS = ["normal", "90", "180", "270"]
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    def refresh(self):
+        proc.in_thread(lambda: proc.run(["wlr-randr", "--json"]), self.show)
+
+    def show(self, res):
+        clear(self.dyn)
+        rc, out = res if not isinstance(res, Exception) else (1, str(res))
+        try:
+            outputs = json.loads(out) if rc == 0 else None
+        except ValueError:
+            outputs = None
+        if not outputs:
+            self.dyn.append(label("Could not read displays: " + out.strip(), "dim", wrap=True))
+            return
+        self.outputs = outputs
+        for o in outputs:
+            title = " ".join(x for x in (o.get("name"), "·", o.get("make"), o.get("model")) if x)
+            g, card = group(title)
+            modes, seen = [], set()
+            for m in o.get("modes", []):
+                key = (m["width"], m["height"], round(m["refresh"], 2))
+                if key not in seen:
+                    seen.add(key)
+                    modes.append(m)
+            modes.sort(key=lambda m: (-m["width"] * m["height"], -m["refresh"]))
+            cur = next((i for i, m in enumerate(modes) if m.get("current")), 0)
+            mode_dd = dropdown([f"{m['width']} × {m['height']}  ·  {m['refresh']:.2f} Hz"
+                                + ("  (recommended)" if m.get("preferred") else "") for m in modes], cur)
+            sc = f"{o.get('scale', 1):g}"
+            scale_dd = dropdown(self.SCALES, self.SCALES.index(sc) if sc in self.SCALES else 0)
+            tr = o.get("transform", "normal")
+            rot_dd = dropdown(self.ROTS, self.ROTS.index(tr) if tr in self.ROTS else 0)
+            en = Gtk.Switch(active=o.get("enabled", True))
+            card.append(row("Enabled", None, en))
+            card.append(row("Resolution", None, mode_dd))
+            card.append(row("Scale", "Bigger text and controls on high-DPI screens", scale_dd))
+            card.append(row("Rotation", None, rot_dd))
+            apply_btn = button("Apply", lambda o=o, md=modes, a=(mode_dd, scale_dd, rot_dd, en):
+                               self.apply(o, md, *a), "suggested")
+            r = row("", None, apply_btn)
+            card.append(r)
+            self.dyn.append(g)
+
+    def _state(self, o):
+        cur = next((m for m in o.get("modes", []) if m.get("current")), None)
+        st = {"enabled": o.get("enabled", True), "scale": o.get("scale", 1),
+              "transform": o.get("transform", "normal")}
+        if cur:
+            st["mode"] = f"{cur['width']}x{cur['height']}@{cur['refresh']:.3f}Hz"
+        return st
+
+    def apply(self, o, modes, mode_dd, scale_dd, rot_dd, en):
+        m = modes[mode_dd.get_selected()]
+        new = {"enabled": en.get_active(), "mode": f"{m['width']}x{m['height']}@{m['refresh']:.3f}Hz",
+               "scale": float(self.SCALES[scale_dd.get_selected()]),
+               "transform": self.ROTS[rot_dd.get_selected()]}
+        if not new["enabled"] and sum(1 for x in self.outputs if x.get("enabled")) <= 1:
+            self.say("You can't turn off your only active display.")
+            return
+        old = self._state(o)
+        rc, out = proc.run(config.randr_args(o["name"], new))
+        if rc:
+            self.say("Failed: " + out.strip())
+            return
+        self.ask_keep(o["name"], old, new)
+
+    def ask_keep(self, name, old, new):
+        cancel = Gio.Cancellable()
+        left = {"n": 15}
+        kept = {"v": False}
+
+        def revert():
+            proc.run(config.randr_args(name, old))
+            self.say("Reverted to the previous display settings.")
+            self.refresh()
+
+        def keep():
+            kept["v"] = True
+            data = config.load_display()
+            data[name] = new
+            config.save_display(data)
+            self.say("Display settings saved.")
+            self.refresh()
+
+        def tick():
+            if kept["v"] or cancel.is_cancelled():
+                return False
+            left["n"] -= 1
+            if left["n"] <= 0:
+                cancel.cancel()
+                revert()
+                return False
+            return True
+
+        def done_cb(d, res):
+            try:
+                idx = d.choose_finish(res)
+            except GLib.Error:
+                idx = -1
+            if idx == 1:
+                keep()
+            elif not cancel.is_cancelled():
+                cancel.cancel()
+                revert()
+        dlg = Gtk.AlertDialog(message="Keep these display settings?",
+                              detail="Reverting automatically in 15 seconds.",
+                              buttons=["Revert", "Keep"])
+        dlg.choose(self.win, cancel, done_cb)
+        GLib.timeout_add_seconds(1, tick)
+
+
+# --------------------------------------------------------------------------- Network
+class NetworkPage(Page):
+    title = "Network"
+    subtitle = "Connections managed by NetworkManager."
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    def refresh(self):
+        def load():
+            return (net.nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device")[1],
+                    net.connectivity(), net.saved_connections(), proc.out(["hostnamectl", "hostname"]).strip())
+        proc.in_thread(load, self.show)
+
+    def show(self, res):
+        clear(self.dyn)
+        if isinstance(res, Exception):
+            self.say(str(res))
+            return
+        devs, conn, saved, host = res
+        g, card = group("Status")
+        card.append(row("Internet", None, label({"full": "Connected", "limited": "Limited",
+                                                  "portal": "Sign-in required", "none": "Offline"}.get(conn, conn), "dim")))
+        entry = Gtk.Entry(text=host)
+        box = hbox(8)
+        box.append(entry)
+        box.append(button("Rename", lambda: self.run(HELPER + ["hostname", entry.get_text().strip()],
+                                                     ok="Hostname changed.")))
+        card.append(row("Computer name", "How this device appears on the network", box))
+        self.dyn.append(g)
+        g, card = group("Devices")
+        for line in devs.splitlines():
+            f = net.split_terse(line)
+            if len(f) < 4 or f[1] in ("loopback", "wifi-p2p"):
+                continue
+            card.append(row(f"{f[0]}  ·  {f[1]}", f[3] or None, label(f[2], "dim")))
+        self.dyn.append(g)
+        g, card = group("Saved connections")
+        for c in saved:
+            if c["type"] == "loopback":
+                continue
+            card.append(row(c["name"], c["type"] + (f" · active on {c['device']}" if c["device"] else ""),
+                            button("Forget", lambda u=c["uuid"]: self.run(["nmcli", "connection", "delete", "uuid", u],
+                                                                            done=lambda *_: self.refresh(), ok="Connection removed."), "danger")))
+        self.dyn.append(g)
+
+
+class WifiPage(Page):
+    title = "Wi-Fi"
+    subtitle = "Wireless networks nearby."
+
+    def build(self):
+        g, card = group(None)
+        self.sw = Gtk.Switch()
+        self.sw.connect("notify::active", self.on_toggle)
+        card.append(row("Wi-Fi", None, self.sw))
+        self.body.append(g)
+        head = hbox(8)
+        head.append(label("NETWORKS", "group-title"))
+        sp = label("")
+        sp.set_hexpand(True)
+        head.append(sp)
+        head.append(button("Scan", lambda: self.refresh(True), "flat"))
+        self.body.append(head)
+        self.list = vbox(0, "card")
+        self.body.append(self.list)
+
+    def refresh(self, rescan=False):
+        self.say("Scanning…" if rescan else "")
+        proc.in_thread(lambda: (net.wifi_enabled(), net.networks(rescan), net.wifi_device()), self.show)
+
+    def show(self, res):
+        if isinstance(res, Exception):
+            self.say(str(res))
+            return
+        enabled, nets, dev = res
+        self._loading = True
+        self.sw.set_active(enabled)
+        self._loading = False
+        clear(self.list)
+        if not dev:
+            self.list.append(row("No Wi-Fi adapter detected", "Wired or virtual machines usually have none."))
+            return
+        if not enabled:
+            self.list.append(row("Wi-Fi is off"))
+            return
+        for n in nets:
+            sub = f"{n['signal']}% · " + (n["security"] or "Open")
+            if n["active"]:
+                w = button("Disconnect", lambda: proc.in_thread(net.disconnect, lambda _r: self.refresh()))
+                sub = "Connected · " + sub
+            else:
+                w = button("Connect", lambda n=n: self.connect(n))
+            self.list.append(row(n["ssid"], sub, w))
+        self.say("" if nets else "No networks found.")
+
+    def on_toggle(self, *_):
+        if not self._loading:
+            on = self.sw.get_active()
+            proc.in_thread(lambda: net.set_wifi(on), lambda _r: GLib.timeout_add_seconds(2, lambda: (self.refresh(), False)[1]))
+
+    def connect(self, n):
+        known = any(c["name"] == n["ssid"] for c in net.saved_connections())
+
+        def go(pw):
+            self.say(f"Connecting to {n['ssid']}…")
+            proc.in_thread(lambda: net.connect(n["ssid"], n["security"], pw),
+                           lambda err: (self.say(f"Could not connect: {err}" if err else f"Connected to {n['ssid']}."),
+                                        self.refresh()))
+        if n["security"] and not known:
+            def submit(v):
+                if len(v["pw"]) < 8:
+                    return "Wi-Fi passwords are at least 8 characters."
+                go(v["pw"])
+            theme.form(self.win, f"Connect to “{n['ssid']}”", [("pw", "Password", "secret")], "Connect", submit)
+        else:
+            go(None)
+
+
+# --------------------------------------------------------------------------- Bluetooth
+class BluetoothPage(Page):
+    title = "Bluetooth"
+    subtitle = "Pair headphones, keyboards and other devices."
+
+    def build(self):
+        g, card = group(None)
+        self.sw = Gtk.Switch()
+        self.sw.connect("notify::active", self.on_toggle)
+        card.append(row("Bluetooth", None, self.sw))
+        self.body.append(g)
+        head = hbox(8)
+        head.append(label("DEVICES", "group-title"))
+        sp = label("")
+        sp.set_hexpand(True)
+        head.append(sp)
+        self.scan_btn = button("Scan for devices", self.scan, "flat")
+        head.append(self.scan_btn)
+        self.body.append(head)
+        self.list = vbox(0, "card")
+        self.body.append(self.list)
+
+    @staticmethod
+    def _load():
+        show = proc.run(["bluetoothctl", "show"])[1]
+        if "No default controller" in show or "Controller" not in show:
+            return None, []
+        powered = "Powered: yes" in show
+        devs = []
+        for line in proc.out(["bluetoothctl", "devices"]).splitlines():
+            m = re.match(r"^Device (\S+) (.*)$", line)
+            if m:
+                inf = proc.out(["bluetoothctl", "info", m.group(1)])
+                devs.append({"mac": m.group(1), "name": m.group(2),
+                             "paired": "Paired: yes" in inf, "connected": "Connected: yes" in inf})
+        devs.sort(key=lambda d: (not d["connected"], not d["paired"], d["name"]))
+        return powered, devs
+
+    def refresh(self):
+        proc.in_thread(self._load, self.show)
+
+    def show(self, res):
+        if isinstance(res, Exception):
+            self.say(str(res))
+            return
+        powered, devs = res
+        clear(self.list)
+        if powered is None:
+            self.list.append(row("No Bluetooth adapter found"))
+            self.sw.set_sensitive(False)
+            self.scan_btn.set_sensitive(False)
+            return
+        self._loading = True
+        self.sw.set_active(powered)
+        self._loading = False
+        self.scan_btn.set_sensitive(powered)
+        if not powered:
+            self.list.append(row("Bluetooth is off"))
+            return
+        for d in devs:
+            box = hbox(6)
+            if d["connected"]:
+                box.append(button("Disconnect", lambda m=d["mac"]: self.bt(["disconnect", m])))
+            elif d["paired"]:
+                box.append(button("Connect", lambda m=d["mac"]: self.bt(["connect", m])))
+            else:
+                box.append(button("Pair", lambda m=d["mac"]: self.pair(m), "suggested"))
+            if d["paired"]:
+                box.append(button("Forget", lambda m=d["mac"]: self.bt(["remove", m]), "danger"))
+            state = "Connected" if d["connected"] else ("Paired" if d["paired"] else "Available")
+            self.list.append(row(d["name"], f"{state} · {d['mac']}", box))
+        if not devs:
+            self.list.append(row("No devices yet", "Put your device in pairing mode and scan."))
+
+    def bt(self, args):
+        self.run(["bluetoothctl", *args], done=lambda *_: self.refresh(), timeout=40)
+
+    def pair(self, mac):
+        self.say("Pairing…")
+        self.run(["sh", "-c", f"bluetoothctl --timeout 25 pair {mac} && bluetoothctl trust {mac} && bluetoothctl connect {mac}"],
+                 done=lambda *_: self.refresh(), ok="Paired and connected.", timeout=90)
+
+    def scan(self):
+        self.say("Scanning for 10 seconds…")
+        self.run(["bluetoothctl", "--timeout", "10", "scan", "on"], done=lambda *_: (self.say(""), self.refresh()), timeout=30)
+
+    def on_toggle(self, *_):
+        if not self._loading:
+            self.run(["bluetoothctl", "power", "on" if self.sw.get_active() else "off"], done=lambda *_: self.refresh())
+
+
+# --------------------------------------------------------------------------- Sound
+class SoundPage(Page):
+    title = "Sound"
+    subtitle = "Output and input devices (PipeWire)."
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    @staticmethod
+    def _load():
+        def js(kind):
+            rc, out = proc.run(["pactl", "-f", "json", "list", kind])
+            try:
+                return json.loads(out) if rc == 0 else []
+            except ValueError:
+                return []
+        return (js("sinks"), [s for s in js("sources") if not s.get("name", "").endswith(".monitor")],
+                proc.out(["pactl", "get-default-sink"]).strip(), proc.out(["pactl", "get-default-source"]).strip())
+
+    def refresh(self):
+        proc.in_thread(self._load, self.show)
+
+    def _vol(self, dev):
+        try:
+            return int(next(iter(dev["volume"].values()))["value_percent"].rstrip("%"))
+        except (KeyError, StopIteration, ValueError, AttributeError):
+            return 0
+
+    def show(self, res):
+        clear(self.dyn)
+        if isinstance(res, Exception):
+            self.say(str(res))
+            return
+        sinks, sources, dsink, dsource = res
+        for title, devs, default, kind in (("Output", sinks, dsink, "sink"), ("Input", sources, dsource, "source")):
+            g, card = group(title)
+            if not devs:
+                card.append(row(f"No {title.lower()} devices"))
+                self.dyn.append(g)
+                continue
+            names = [d["name"] for d in devs]
+            idx = names.index(default) if default in names else 0
+            dd = dropdown([d.get("description", d["name"]) for d in devs], idx)
+            dd.connect("notify::selected", lambda w, n=names, k=kind: self.run(["pactl", f"set-default-{k}", n[w.get_selected()]],
+                                                                               done=lambda *_: self.refresh()))
+            card.append(row("Device", None, dd))
+            dev = devs[idx]
+            sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+            sc.set_value(self._vol(dev))
+            sc.set_size_request(260, -1)
+            sc.connect("value-changed", lambda s, k=kind: proc.run(["pactl", f"set-{k}-volume", f"@DEFAULT_{k.upper()}@", f"{int(s.get_value())}%"]))
+            card.append(row("Volume", None, sc))
+            mute = Gtk.Switch(active=bool(dev.get("mute")))
+            mute.connect("notify::active", lambda s, *_a, k=kind: proc.run(["pactl", f"set-{k}-mute", f"@DEFAULT_{k.upper()}@", "1" if s.get_active() else "0"]))
+            card.append(row("Mute", None, mute))
+            self.dyn.append(g)
+
+
+# --------------------------------------------------------------------------- Input
+LAYOUTS = [("us", "English (US)"), ("gb", "English (UK)"), ("ru", "Russian"), ("ua", "Ukrainian"),
+           ("by", "Belarusian"), ("kz", "Kazakh"), ("de", "German"), ("fr", "French"), ("es", "Spanish"),
+           ("it", "Italian"), ("pt", "Portuguese"), ("br", "Portuguese (Brazil)"), ("pl", "Polish"),
+           ("cz", "Czech"), ("tr", "Turkish"), ("se", "Swedish"), ("fi", "Finnish"), ("no", "Norwegian"),
+           ("dk", "Danish"), ("nl", "Dutch"), ("jp", "Japanese"), ("kr", "Korean"), ("cn", "Chinese"),
+           ("am", "Armenian"), ("ge", "Georgian"), ("az", "Azerbaijani"), ("uz", "Uzbek")]
+SWITCHES = [("Alt + Shift", "grp:alt_shift_toggle"), ("Ctrl + Shift", "grp:ctrl_shift_toggle"),
+            ("Super + Space", "grp:win_space_toggle"), ("Caps Lock", "grp:caps_toggle")]
+
+
+class KeyboardPage(Page):
+    title = "Keyboard"
+    subtitle = "Layouts, switching and key repeat."
+
+    def build(self):
+        g, self.lay_card = group("Layouts")
+        self.body.append(g)
+        g, card = group("Behaviour")
+        self.sw_dd = dropdown([s[0] for s in SWITCHES])
+        self.delay = Gtk.SpinButton.new_with_range(150, 1000, 25)
+        self.rate = Gtk.SpinButton.new_with_range(10, 60, 1)
+        card.append(row("Switch layout with", None, self.sw_dd))
+        card.append(row("Repeat delay (ms)", None, self.delay))
+        card.append(row("Repeat rate (keys/s)", None, self.rate))
+        card.append(row("Try it", None, Gtk.Entry(placeholder_text="Type here…")))
+        self.body.append(g)
+        for w, sig in ((self.sw_dd, "notify::selected"), (self.delay, "value-changed"), (self.rate, "value-changed")):
+            w.connect(sig, lambda *_: self.save())
+
+    def refresh(self):
+        self._loading = True
+        s = config.load()["keyboard"]
+        clear(self.lay_card)
+        codes = [c for c in s["layouts"].split(",") if c]
+        names = dict(LAYOUTS)
+        for c in codes:
+            rm = button("Remove", lambda c=c: self.set_layouts([x for x in codes if x != c]), "flat", len(codes) > 1)
+            self.lay_card.append(row(names.get(c, c), c, rm))
+        avail = [l for l in LAYOUTS if l[0] not in codes]
+        dd = dropdown([n for _, n in avail])
+        box = hbox(8)
+        box.append(dd)
+        box.append(button("Add", lambda: self.set_layouts(codes + [avail[dd.get_selected()][0]]) if avail else None))
+        self.lay_card.append(row("Add layout", None, box))
+        opts = [o for _, o in SWITCHES]
+        self.sw_dd.set_selected(opts.index(s["options"]) if s["options"] in opts else 0)
+        self.delay.set_value(s["repeat_delay"])
+        self.rate.set_value(s["repeat_rate"])
+        self._loading = False
+
+    def set_layouts(self, codes):
+        s = config.load()
+        s["keyboard"]["layouts"] = ",".join(codes[:4])
+        config.save(s)
+        self.say(config.apply_labwc(s) or "Layouts applied.")
+        self.refresh()
+
+    def save(self):
+        if self._loading:
+            return
+        s = config.load()
+        s["keyboard"].update(options=SWITCHES[self.sw_dd.get_selected()][1],
+                             repeat_delay=int(self.delay.get_value()), repeat_rate=int(self.rate.get_value()))
+        config.save(s)
+        self.say(config.apply_labwc(s) or "Applied.")
+
+
+class PointerPage(Page):
+    kind = "mouse"
+
+    def build(self):
+        g, card = group(None)
+        self.speed = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1, 1, 0.1)
+        self.speed.set_size_request(240, -1)
+        self.natural = Gtk.Switch()
+        card.append(row("Pointer speed", None, self.speed))
+        card.append(row("Natural scrolling", "Content follows your fingers", self.natural))
+        self.extra = {}
+        opts = [("left_handed", "Left-handed buttons", None)] if self.kind == "mouse" else \
+               [("tap", "Tap to click", None), ("dwt", "Disable while typing", None)]
+        for key, title, sub in opts:
+            sw = Gtk.Switch()
+            self.extra[key] = sw
+            card.append(row(title, sub, sw))
+        self.body.append(g)
+        self._timer = None
+        self.speed.connect("value-changed", lambda *_: self.save())
+        for w in [self.natural, *self.extra.values()]:
+            w.connect("notify::active", lambda *_: self.save())
+
+    def refresh(self):
+        self._loading = True
+        v = config.load()[self.kind]
+        self.speed.set_value(v["speed"])
+        self.natural.set_active(v["natural"])
+        for k, w in self.extra.items():
+            w.set_active(bool(v[k]))
+        self._loading = False
+        if self.kind == "touchpad":
+            try:
+                has = "touchpad" in open("/proc/bus/input/devices").read().lower()
+            except OSError:
+                has = True
+            self.say("" if has else "No touchpad detected. Settings will apply when one is connected.")
+
+    def save(self):
+        if self._loading:
+            return
+        if self._timer:
+            GLib.source_remove(self._timer)
+
+        def commit():
+            self._timer = None
+            s = config.load()
+            s[self.kind]["speed"] = round(self.speed.get_value(), 2)
+            s[self.kind]["natural"] = self.natural.get_active()
+            for k, w in self.extra.items():
+                s[self.kind][k] = w.get_active()
+            config.save(s)
+            self.say(config.apply_labwc(s) or "Applied.")
+            return False
+        self._timer = GLib.timeout_add(300, commit)
+
+
+class MousePage(PointerPage):
+    title = "Mouse"
+    subtitle = "Speed, scrolling and button order."
+    kind = "mouse"
+
+
+class TouchpadPage(PointerPage):
+    title = "Touchpad"
+    subtitle = "Gestures, tapping and speed."
+    kind = "touchpad"
+
+
+# --------------------------------------------------------------------------- Users
+class UsersPage(Page):
+    title = "Users"
+    subtitle = "Accounts on this computer. Administrators are members of the wheel group (sudo/polkit)."
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    def refresh(self):
+        clear(self.dyn)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        try:
+            wheel = set(grp.getgrnam("wheel").gr_mem)
+        except KeyError:
+            wheel = set()
+        users = [p for p in pwd.getpwall() if 1000 <= p.pw_uid < 60000 and not p.pw_shell.endswith(("nologin", "false"))]
+        g, card = group("Your account")
+        card.append(row(me, "Administrator" if me in wheel else "Standard user",
+                        button("Change password", lambda: proc.spawn(["foot", "-T", "Change password", "-e", "passwd"]))))
+        self.dyn.append(g)
+        g, card = group("Other users")
+        for p in users:
+            if p.pw_name == me:
+                continue
+            box = hbox(8)
+            adm = Gtk.CheckButton(label="Admin", active=p.pw_name in wheel)
+            adm.connect("toggled", lambda c, u=p.pw_name: self.run(HELPER + ["user-admin", u, "1" if c.get_active() else "0"], done=lambda *_: self.refresh()))
+            box.append(adm)
+            box.append(button("Password…", lambda u=p.pw_name: self.set_password(u)))
+            box.append(button("Delete", lambda u=p.pw_name: theme.confirm(self.win, f"Delete {u}?", "Their home folder will be removed permanently.",
+                                                                           "Delete", lambda: self.run(HELPER + ["user-del", u], done=lambda *_: self.refresh(), ok="User deleted.")), "danger"))
+            card.append(row(p.pw_gecos.split(",")[0] or p.pw_name, p.pw_name, box))
+        card.append(row("Add a user", None, button("Add…", self.add_user, "suggested")))
+        self.dyn.append(g)
+
+    def add_user(self):
+        def submit(v):
+            if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", v["user"]):
+                return "Username: lowercase letters, digits, - and _ (max 32)."
+            if len(v["pw"]) < 6 or v["pw"] != v["pw2"]:
+                return "Passwords must match and be at least 6 characters."
+            h = openssl_hash(v["pw"])
+            if not h:
+                return "Could not hash password (openssl missing?)."
+            self.run(HELPER + ["user-add", v["user"], v["full"].replace(":", " "), "1" if v["admin"] else "0"],
+                     input=h + "\n", done=lambda *_: self.refresh(), ok=f"User {v['user']} created.")
+        theme.form(self.win, "New user", [("full", "Full name", "text"), ("user", "Username", "text"),
+                                          ("pw", "Password", "secret"), ("pw2", "Confirm password", "secret"),
+                                          ("admin", "Administrator", "check")], "Create", submit)
+
+    def set_password(self, user):
+        def submit(v):
+            if len(v["pw"]) < 6 or v["pw"] != v["pw2"]:
+                return "Passwords must match and be at least 6 characters."
+            self.run(HELPER + ["user-passwd", user], input=openssl_hash(v["pw"]) + "\n", ok="Password changed.")
+        theme.form(self.win, f"New password for {user}", [("pw", "Password", "secret"), ("pw2", "Confirm", "secret")], "Change", submit)
+
+
+# --------------------------------------------------------------------------- Privacy / Security
+class PrivacyPage(Page):
+    title = "Privacy"
+    subtitle = "Kocmoc OS has no telemetry. Local history is under your control."
+
+    def build(self):
+        g, card = group("History")
+        self.recent = Gtk.Switch()
+        self.recent.connect("notify::active", self.on_recent)
+        card.append(row("Remember recently used files", "Used by file choosers and apps", self.recent))
+        card.append(row("Recent files list", None, button("Clear", lambda: self.rm(["~/.local/share/recently-used.xbel"], "Recent files cleared."))))
+        card.append(row("Thumbnail cache", None, button("Clear", lambda: self.rm(["~/.cache/thumbnails"], "Thumbnails cleared."))))
+        card.append(row("Shell history", "~/.bash_history", button("Clear", lambda: self.rm(["~/.bash_history"], "Shell history cleared."))))
+        self.body.append(g)
+
+    def refresh(self):
+        self._loading = True
+        self.recent.set_active(config.load()["privacy"]["recent_files"])
+        self._loading = False
+
+    def on_recent(self, *_):
+        if self._loading:
+            return
+        s = config.load()
+        s["privacy"]["recent_files"] = self.recent.get_active()
+        config.save(s)
+        config.write_gtk_settings(s)
+        self.say("Saved.")
+
+    def rm(self, paths, msg):
+        for p in paths:
+            p = os.path.expanduser(p)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.exists(p):
+                os.remove(p)
+        self.say(msg)
+
+
+class SecurityPage(Page):
+    title = "Security"
+    subtitle = "Firewall, administrators and screen locking."
+
+    def build(self):
+        g, card = group("Firewall (ufw)")
+        self.fw = Gtk.Switch()
+        self.fw.connect("notify::active", self.on_fw)
+        card.append(row("Firewall", "Blocks incoming connections, allows outgoing", self.fw))
+        card.append(row("Detailed rules", None, button("Show…", lambda: self.run(HELPER + ["firewall", "status"], done=lambda rc, out: rc == 0 and theme.alert(self.win, "Firewall status", out)))))
+        self.body.append(g)
+        g, self.adm_card = group("Administrators")
+        self.body.append(g)
+        g, card = group("Screen")
+        card.append(row("Lock now", "Super + L", button("Lock", lambda: proc.spawn(["kocmoc-lock"]))))
+        card.append(row("Automatic lock", "Configured in Power", button("Open", lambda: self.win.show_page("power"))))
+        self.body.append(g)
+
+    def refresh(self):
+        self._loading = True
+        try:
+            enabled = "ENABLED=yes" in open("/etc/ufw/ufw.conf").read()
+        except OSError:
+            enabled = False
+        active = proc.run(["systemctl", "is-active", "ufw"])[1].strip() == "active"
+        self.fw.set_active(enabled and active)
+        self._loading = False
+        clear(self.adm_card)
+        try:
+            members = grp.getgrnam("wheel").gr_mem
+        except KeyError:
+            members = []
+        for m in members:
+            self.adm_card.append(row(m, "Can use sudo and approve system changes"))
+        self.adm_card.append(row("Root account", "Locked. Administrative actions go through sudo / polkit."))
+
+    def on_fw(self, *_):
+        if not self._loading:
+            self.run(HELPER + ["firewall", "enable" if self.fw.get_active() else "disable"],
+                     done=lambda *_: self.refresh(), ok="Firewall updated.")
+
+
+# --------------------------------------------------------------------------- Applications / Storage
+class ApplicationsPage(Page):
+    title = "Applications"
+    subtitle = "Default apps for links and file types."
+    CATS = [("Web browser", ["x-scheme-handler/http", "x-scheme-handler/https", "text/html"]),
+            ("File manager", ["inode/directory"]),
+            ("Text editor", ["text/plain"]),
+            ("Image viewer", ["image/png", "image/jpeg", "image/webp", "image/gif"]),
+            ("Archives", ["application/zip", "application/x-tar", "application/x-7z-compressed", "application/gzip"])]
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    def refresh(self):
+        clear(self.dyn)
+        g, card = group("Defaults")
+        for title, mimes in self.CATS:
+            apps = Gio.AppInfo.get_all_for_type(mimes[0])
+            if not apps:
+                continue
+            cur = Gio.AppInfo.get_default_for_type(mimes[0], False)
+            ids = [a.get_id() for a in apps]
+            idx = ids.index(cur.get_id()) if cur and cur.get_id() in ids else 0
+            dd = dropdown([a.get_display_name() for a in apps], idx)
+            dd.connect("notify::selected", lambda w, a=apps, m=mimes: self.set_default(a[w.get_selected()], m))
+            card.append(row(title, None, dd))
+        self.dyn.append(g)
+        g, card = group("Installed")
+        n = len([a for a in Gio.AppInfo.get_all() if a.should_show()])
+        card.append(row(f"{n} applications", "Install or remove software in the App Store",
+                        button("Open App Store", lambda: proc.spawn(["kocmoc-app-store"]))))
+        self.dyn.append(g)
+
+    def set_default(self, app, mimes):
+        try:
+            for m in mimes:
+                app.set_as_default_for_type(m)
+            self.say(f"{app.get_display_name()} is now the default.")
+        except GLib.Error as e:
+            self.say(e.message)
+
+
+class StoragePage(Page):
+    title = "Storage"
+    subtitle = "Disk usage and drives."
+
+    def build(self):
+        self.dyn = vbox(18)
+        self.body.append(self.dyn)
+
+    def refresh(self):
+        clear(self.dyn)
+        g, card = group("Usage")
+        seen = set()
+        for path, name in (("/", "System"), (os.path.expanduser("~"), "Home")):
+            st = os.stat(path).st_dev
+            if st in seen:
+                continue
+            seen.add(st)
+            u = shutil.disk_usage(path)
+            bar = Gtk.LevelBar(min_value=0, max_value=1, value=u.used / u.total)
+            bar.set_size_request(260, 8)
+            card.append(row(f"{name}", f"{disks.human(u.used)} used of {disks.human(u.total)} · {disks.human(u.free)} free", bar))
+        self.dyn.append(g)
+        g, card = group("Drives")
+        for d in disks.lsblk():
+            if d.get("type") not in ("disk",) or d["name"].startswith("zram"):
+                continue
+            parts = ", ".join(f"{c['name']} {c.get('fstype') or ''} {' '.join(x for x in (c.get('mountpoints') or []) if x)}".strip()
+                              for c in d.get("children", []) or [])
+            card.append(row(f"{d.get('model') or d['name']}  ·  {disks.human(d.get('size'))}",
+                            ("Removable · " if d.get("rm") else "") + (parts or "No partitions")))
+        tools = hbox(8)
+        tools.append(button("Open Files", lambda: proc.spawn(["thunar"])))
+        if proc.which("gparted"):
+            tools.append(button("Partition editor", lambda: proc.spawn(["gparted"])))
+        card.append(row("USB drives appear automatically in Files.", None, tools))
+        self.dyn.append(g)
+        g, card = group("Maintenance")
+        card.append(row("Package cache", "Keeps the two latest versions of each package",
+                        button("Clean", lambda: self.run(HELPER + ["pkg-clean"], ok="Package cache cleaned."))))
+        self.dyn.append(g)
+
+
+# --------------------------------------------------------------------------- Power
+class PowerPage(Page):
+    title = "Power"
+    subtitle = "Performance profile, battery and idle behaviour."
+    LOCK = [0, 1, 2, 5, 10, 15, 30]
+    SUSP = [0, 15, 30, 60, 120]
+
+    def build(self):
+        g, self.info_card = group("Status")
+        self.body.append(g)
+        g, card = group("When idle")
+        self.lock_dd = dropdown(["Never" if m == 0 else f"{m} min" for m in self.LOCK])
+        self.susp_dd = dropdown(["Never" if m == 0 else f"{m} min" for m in self.SUSP])
+        card.append(row("Lock screen after", None, self.lock_dd))
+        card.append(row("Suspend after", None, self.susp_dd))
+        self.body.append(g)
+        for w in (self.lock_dd, self.susp_dd):
+            w.connect("notify::selected", self.save)
+        g, card = group("Session")
+        box = hbox(8)
+        box.append(button("Suspend", lambda: proc.spawn(["systemctl", "suspend"])))
+        box.append(button("Restart", lambda: theme.confirm(self.win, "Restart now?", "", "Restart", lambda: proc.spawn(["systemctl", "reboot"]))))
+        box.append(button("Shut down", lambda: theme.confirm(self.win, "Shut down now?", "", "Shut down", lambda: proc.spawn(["systemctl", "poweroff"])), "danger"))
+        card.append(row("Power actions", None, box))
+        self.body.append(g)
+
+    def refresh(self):
+        self._loading = True
+        p = config.load()["power"]
+        self.lock_dd.set_selected(self.LOCK.index(p["lock_after"]) if p["lock_after"] in self.LOCK else 0)
+        self.susp_dd.set_selected(self.SUSP.index(p["suspend_after"]) if p["suspend_after"] in self.SUSP else 0)
+        self._loading = False
+        clear(self.info_card)
+        for bat in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+            try:
+                cap = open(os.path.join(bat, "capacity")).read().strip()
+                st = open(os.path.join(bat, "status")).read().strip()
+                bar = Gtk.LevelBar(min_value=0, max_value=100, value=float(cap))
+                bar.set_size_request(200, 8)
+                self.info_card.append(row(f"Battery {cap}%", st, bar))
+            except OSError:
+                pass
+        out = proc.out(["powerprofilesctl", "list"])
+        profiles = re.findall(r"^\s*(\*?)\s*([a-z-]+):\s*$", out, re.M)
+        if profiles:
+            names = [p[1] for p in profiles]
+            cur = next((i for i, p in enumerate(profiles) if p[0]), 0)
+            dd = dropdown([n.replace("-", " ").title() for n in names], cur)
+            dd.connect("notify::selected", lambda w: self.run(["powerprofilesctl", "set", names[w.get_selected()]], ok="Power profile changed."))
+            self.info_card.append(row("Power mode", None, dd))
+        if not self.info_card.get_first_child():
+            self.info_card.append(row("On AC power", "No battery detected"))
+
+    def save(self, *_):
+        if self._loading:
+            return
+        s = config.load()
+        s["power"]["lock_after"] = self.LOCK[self.lock_dd.get_selected()]
+        s["power"]["suspend_after"] = self.SUSP[self.susp_dd.get_selected()]
+        config.save(s)
+        proc.restart("swayidle", ["kocmoc-idle"])
+        self.say("Idle settings applied.")
+
+
+# --------------------------------------------------------------------------- Date & Time
+class DateTimePage(Page):
+    title = "Date & Time"
+    subtitle = "Time zone, network time and clock format (systemd-timedated)."
+
+    def build(self):
+        g, card = group(None)
+        self.now = label("", "clock-big")
+        card.append(row("Current time", None, self.now))
+        self.tz_card = card
+        self.ntp = Gtk.Switch()
+        self.ntp.connect("notify::active", self.on_ntp)
+        card.append(row("Set time automatically", "Synchronise with internet time servers", self.ntp))
+        self.h24 = Gtk.Switch()
+        self.h24.connect("notify::active", self.on_24h)
+        card.append(row("24-hour clock", None, self.h24))
+        self.manual = Gtk.Entry(placeholder_text="YYYY-MM-DD HH:MM:SS")
+        mbox = hbox(8)
+        mbox.append(self.manual)
+        mbox.append(button("Set", lambda: self.run(["timedatectl", "set-time", self.manual.get_text().strip()], ok="Time set.")))
+        self.manual_row = row("Set time manually", "Only when automatic time is off", mbox)
+        card.append(self.manual_row)
+        self.body.append(g)
+        self.tz_dd = None
+        self._tick = None
+
+    def refresh(self):
+        self._loading = True
+        info = dict(l.split("=", 1) for l in proc.out(["timedatectl", "show"]).splitlines() if "=" in l)
+        self.ntp.set_active(info.get("NTP") == "yes")
+        self.manual_row.set_sensitive(info.get("NTP") != "yes")
+        self.h24.set_active(config.load()["clock"]["24h"])
+        zones = proc.out(["timedatectl", "list-timezones"]).split()
+        cur = info.get("Timezone", "UTC")
+        if self.tz_dd is None and zones:
+            self.tz_dd = searchable_dropdown(zones, zones.index(cur) if cur in zones else 0)
+            self.tz_dd.connect("notify::selected", lambda w: (not self._loading) and self.run(
+                ["timedatectl", "set-timezone", zones[w.get_selected()]], ok="Time zone changed."))
+            self.tz_card.append(row("Time zone", None, self.tz_dd))
+        self._loading = False
+        self.update_clock()
+        if not self._tick:
+            self._tick = GLib.timeout_add_seconds(1, self.update_clock)
+
+    def hide(self):
+        if self._tick:
+            GLib.source_remove(self._tick)
+            self._tick = None
+
+    def update_clock(self):
+        fmt = "%H:%M:%S" if config.load()["clock"]["24h"] else "%I:%M:%S %p"
+        self.now.set_text(GLib.DateTime.new_now_local().format(f"%A, %d %B · {fmt}"))
+        return True
+
+    def on_ntp(self, *_):
+        if not self._loading:
+            self.run(["timedatectl", "set-ntp", "true" if self.ntp.get_active() else "false"],
+                     done=lambda *_: self.manual_row.set_sensitive(not self.ntp.get_active()))
+
+    def on_24h(self, *_):
+        if self._loading:
+            return
+        s = config.load()
+        s["clock"]["24h"] = self.h24.get_active()
+        config.save(s)
+        proc.restart("waybar", ["kocmoc-panel"])
+        self.say("Clock format updated.")
+
+
+# --------------------------------------------------------------------------- About
+class AboutPage(Page):
+    title = "About Kocmoc OS"
+
+    def build(self):
+        hero = vbox(6, "hero")
+        lp = theme.logo_path()
+        if lp:
+            img = Gtk.Image.new_from_file(lp)
+            img.set_pixel_size(112)
+            hero.append(img)
+        hero.append(label("KOCMOC OS", "hero-title", xalign=0.5))
+        self.ver = label("", "dim", xalign=0.5)
+        hero.append(self.ver)
+        self.body.append(hero)
+        g, self.card = group("This computer")
+        self.body.append(g)
+        box = hbox(8)
+        box.set_halign(Gtk.Align.CENTER)
+        box.append(button("Check for updates", lambda: proc.spawn(["kocmoc-update-center"]), "suggested"))
+        box.append(button("Copy details", self.copy))
+        self.body.append(box)
+
+    def refresh(self):
+        osr = {}
+        try:
+            for l in open("/etc/os-release"):
+                if "=" in l:
+                    k, v = l.rstrip().split("=", 1)
+                    osr[k] = v.strip('"')
+        except OSError:
+            pass
+        self.ver.set_text(f"{osr.get('PRETTY_NAME', 'Kocmoc OS')} · rolling release based on Arch Linux")
+        cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.processor())
+        mem = next((int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith("MemTotal")), 0)
+        gpu = ", ".join(re.sub(r'"', "", " ".join(l.split('" "')[2:4])) for l in proc.out(["lspci", "-mm"]).splitlines()
+                        if re.search(r'"(VGA|3D|Display)', l)) or "Unknown"
+        labwc = proc.out(["labwc", "--version"]).strip().split("\n")[0]
+        self.details = [("Device name", platform.node()), ("Processor", f"{cpu} × {os.cpu_count()}"),
+                        ("Memory", disks.human(mem)), ("Graphics", gpu),
+                        ("Disk", disks.human(shutil.disk_usage("/").total)), ("Kernel", platform.release()),
+                        ("Desktop", f"Kocmoc Shell {VERSION} · {labwc or 'labwc'} · Wayland"),
+                        ("Base", "Arch Linux, pacman")]
+        clear(self.card)
+        for k, v in self.details:
+            self.card.append(row(k, None, label(v, "dim", selectable=True, wrap=True)))
+
+    def copy(self):
+        self.win.get_clipboard().set("\n".join(f"{k}: {v}" for k, v in self.details))
+        self.say("Copied to clipboard.")
+
+
+PAGES = [("appearance", "Appearance", AppearancePage), ("display", "Display", DisplayPage),
+         ("network", "Network", NetworkPage), ("wifi", "Wi-Fi", WifiPage), ("bluetooth", "Bluetooth", BluetoothPage),
+         ("sound", "Sound", SoundPage), ("keyboard", "Keyboard", KeyboardPage), ("mouse", "Mouse", MousePage),
+         ("touchpad", "Touchpad", TouchpadPage), ("users", "Users", UsersPage), ("privacy", "Privacy", PrivacyPage),
+         ("security", "Security", SecurityPage), ("applications", "Applications", ApplicationsPage),
+         ("storage", "Storage", StoragePage), ("power", "Power", PowerPage), ("datetime", "Date & Time", DateTimePage),
+         ("about", "About Kocmoc OS", AboutPage)]
+
+
+class SettingsWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Settings")
+        self.set_default_size(1060, 720)
+        header = Gtk.HeaderBar()
+        header.set_title_widget(label("Settings", "title", xalign=0.5))
+        self.set_titlebar(header)
+        root = hbox(0)
+        side = Gtk.ScrolledWindow()
+        side.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        side.set_size_request(230, -1)
+        side.add_css_class("sidebar")
+        self.nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.nav.add_css_class("navigation")
+        for key, title, _cls in PAGES:
+            r = Gtk.ListBoxRow()
+            r.set_child(label(title))
+            r.key = key
+            self.nav.append(r)
+        side.set_child(self.nav)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=160)
+        self.stack.set_hexpand(True)
+        root.append(side)
+        root.append(self.stack)
+        self.set_child(root)
+        self.pages = {}
+        self.current = None
+        self.nav.connect("row-selected", self.on_select)
+        self.show_page("appearance")
+
+    def show_page(self, key):
+        keys = [p[0] for p in PAGES]
+        if key not in keys:
+            key = "appearance"
+        self.nav.select_row(self.nav.get_row_at_index(keys.index(key)))
+
+    def on_select(self, _lb, r):
+        if r is None:
+            return
+        if self.current and self.current in self.pages:
+            self.pages[self.current].hide()
+        key = r.key
+        if key not in self.pages:
+            cls = next(c for k, _t, c in PAGES if k == key)
+            self.pages[key] = cls(self)
+            self.stack.add_named(self.pages[key].widget, key)
+        self.current = key
+        self.stack.set_visible_child_name(key)
+        self.pages[key].say("")
+        self.pages[key].refresh()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="os.kocmoc.Settings", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        page = args[args.index("--page") + 1] if "--page" in args and args.index("--page") + 1 < len(args) else None
+        if self.win is None:
+            theme.apply()
+            self.win = SettingsWindow(self)
+        if page:
+            self.win.show_page(page)
+        self.win.present()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

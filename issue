@@ -1,0 +1,3 @@
+# Kocmoc OS: firewall on by default (deny incoming, allow outgoing).
+ENABLED=yes
+LOGLEVEL=low

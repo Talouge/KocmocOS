@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lock the session. swaylock authenticates through PAM.
+pgrep -x swaylock >/dev/null && exit 0
+exec swaylock -f -C /etc/xdg/kocmoc/swaylock.conf

@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Idle handling: lock / suspend after the timeouts set in Settings > Power."""
+import os, sys
+sys.path.insert(0, "/usr/lib/kocmoc")
+from kocmoc import config
+p = config.load()["power"]
+args = ["swayidle", "-w"]
+if p.get("lock_after", 0):
+    args += ["timeout", str(int(p["lock_after"]) * 60), "kocmoc-lock"]
+if p.get("suspend_after", 0):
+    args += ["timeout", str(int(p["suspend_after"]) * 60), "systemctl suspend"]
+args += ["before-sleep", "kocmoc-lock"]
+os.execvp("swayidle", args)

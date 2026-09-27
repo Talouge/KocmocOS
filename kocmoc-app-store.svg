@@ -1,0 +1,181 @@
+"""Look & feel plus small GTK4 widget helpers shared by all Kocmoc apps."""
+import os
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib, Gio  # noqa: E402,F401
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_CSS = [
+    os.environ.get("KOCMOC_CSS", ""),
+    "/usr/share/kocmoc/css/kocmoc.css",
+    os.path.join(_HERE, "..", "..", "themes", "kocmoc.css"),  # running from the repo
+]
+LOGO = [
+    "/usr/share/kocmoc/icons/kocmoc-logo.png",
+    os.path.join(_HERE, "..", "..", "icons", "png", "kocmoc-logo.png"),
+]
+
+
+def apply():
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        settings.set_property("gtk-application-prefer-dark-theme", True)
+    for path in _CSS:
+        if path and os.path.exists(path):
+            provider = Gtk.CssProvider()
+            provider.load_from_path(path)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            return
+
+
+def logo_path():
+    return next((p for p in LOGO if os.path.exists(p)), None)
+
+
+def css(widget, classes):
+    for c in (classes or "").split():
+        widget.add_css_class(c)
+    return widget
+
+
+def label(text="", classes=None, xalign=0.0, wrap=False, selectable=False):
+    lb = Gtk.Label(label=text, xalign=xalign)
+    lb.set_wrap(wrap)
+    lb.set_selectable(selectable)
+    return css(lb, classes)
+
+
+def vbox(spacing=0, classes=None):
+    return css(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing), classes)
+
+
+def hbox(spacing=0, classes=None):
+    return css(Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing), classes)
+
+
+def button(text, callback=None, classes=None, sensitive=True):
+    b = Gtk.Button(label=text)
+    if callback:
+        b.connect("clicked", lambda *_: callback())
+    b.set_sensitive(sensitive)
+    return css(b, classes)
+
+
+def page(title, subtitle=None):
+    """Scrollable settings-style page. Returns (outer_widget, content_box)."""
+    content = vbox(18, "page")
+    content.append(label(title, "page-title"))
+    if subtitle:
+        content.append(label(subtitle, "dim", wrap=True))
+    scroller = Gtk.ScrolledWindow()
+    scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scroller.set_vexpand(True)
+    scroller.set_hexpand(True)
+    scroller.set_child(content)
+    return scroller, content
+
+
+def group(title=None):
+    """A titled card. Returns (outer, card)."""
+    outer = vbox(8)
+    if title:
+        outer.append(label(title.upper(), "group-title"))
+    card = vbox(0, "card")
+    outer.append(card)
+    return outer, card
+
+
+def row(title, subtitle=None, widget=None):
+    r = hbox(12, "row")
+    texts = vbox(2)
+    texts.set_hexpand(True)
+    texts.append(label(title, "row-title", wrap=True))
+    if subtitle:
+        texts.append(label(subtitle, "dim small", wrap=True))
+    r.append(texts)
+    if widget is not None:
+        widget.set_valign(Gtk.Align.CENTER)
+        r.append(widget)
+    return r
+
+
+def clear(container):
+    child = container.get_first_child()
+    while child is not None:
+        nxt = child.get_next_sibling()
+        container.remove(child)
+        child = nxt
+
+
+def dropdown(strings, selected=0):
+    dd = Gtk.DropDown.new_from_strings(list(strings))
+    if strings:
+        dd.set_selected(max(0, min(selected, len(strings) - 1)))
+    return dd
+
+
+def searchable_dropdown(strings, selected=0):
+    dd = dropdown(strings, selected)
+    dd.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+    dd.set_enable_search(True)
+    return dd
+
+
+def alert(parent, title, detail=""):
+    Gtk.AlertDialog(message=title, detail=detail).show(parent)
+
+
+def confirm(parent, title, detail, ok_label, on_ok, cancellable=None):
+    dlg = Gtk.AlertDialog(message=title, detail=detail, buttons=["Cancel", ok_label])
+    dlg.set_cancel_button(0)
+    dlg.set_default_button(1)
+
+    def done(d, res):
+        try:
+            idx = d.choose_finish(res)
+        except GLib.Error:
+            idx = 0
+        if idx == 1:
+            on_ok()
+    dlg.choose(parent, cancellable, done)
+    return dlg
+
+
+def form(parent, title, fields, ok_label, on_ok):
+    """Small modal form. fields: [(key, label, kind)] kind in text|secret|check."""
+    win = Gtk.Window(title=title, modal=True, transient_for=parent, resizable=False)
+    win.set_default_size(420, -1)
+    body = vbox(12, "page")
+    body.append(label(title, "section-title"))
+    widgets = {}
+    for key, text, kind in fields:
+        if kind == "check":
+            w = Gtk.CheckButton(label=text)
+            body.append(w)
+        else:
+            body.append(label(text, "dim small"))
+            w = Gtk.PasswordEntry(show_peek_icon=True) if kind == "secret" else Gtk.Entry()
+            body.append(w)
+        widgets[key] = w
+    err = label("", "error small", wrap=True)
+    body.append(err)
+    btns = hbox(8)
+    btns.set_halign(Gtk.Align.END)
+
+    def submit():
+        values = {k: (w.get_active() if isinstance(w, Gtk.CheckButton) else w.get_text())
+                  for k, w in widgets.items()}
+        problem = on_ok(values)
+        if problem:
+            err.set_text(problem)
+        else:
+            win.close()
+    btns.append(button("Cancel", win.close))
+    btns.append(button(ok_label, submit, "suggested"))
+    body.append(btns)
+    win.set_child(body)
+    win.present()
+    return win

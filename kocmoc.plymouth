@@ -1,0 +1,117 @@
+{
+  "layer": "top",
+  "position": "bottom",
+  "height": 42,
+  "margin-left": 8,
+  "margin-right": 8,
+  "margin-bottom": 8,
+  "spacing": 4,
+  "exclusive": true,
+  "modules-left": [
+    "image#menu",
+    "ext/workspaces",
+    "wlr/taskbar"
+  ],
+  "modules-center": [],
+  "modules-right": [
+    "custom/install",
+    "tray",
+    "network",
+    "bluetooth",
+    "pulseaudio",
+    "battery",
+    "clock",
+    "custom/quick"
+  ],
+  "image#menu": {
+    "path": "/usr/share/kocmoc/icons/kocmoc-mark.png",
+    "size": 22,
+    "on-click": "fuzzel",
+    "tooltip": false
+  },
+  "ext/workspaces": {
+    "format": "{name}",
+    "on-click": "activate",
+    "sort-by-id": true
+  },
+  "wlr/taskbar": {
+    "format": "{icon}",
+    "icon-size": 20,
+    "icon-theme": "Papirus-Dark",
+    "tooltip-format": "{title}",
+    "on-click": "activate",
+    "on-click-middle": "close",
+    "on-click-right": "minimize-raise"
+  },
+  "custom/install": {
+    "exec": "grep -q archisobasedir /proc/cmdline && echo 'Install Kocmoc OS'",
+    "interval": "once",
+    "on-click": "kocmoc-installer",
+    "tooltip": false
+  },
+  "tray": {
+    "icon-size": 16,
+    "spacing": 8
+  },
+  "network": {
+    "format-wifi": "󰤨",
+    "format-ethernet": "󰈀",
+    "format-disconnected": "󰤮",
+    "format-disabled": "󰤮",
+    "tooltip-format-wifi": "{essid} · {signalStrength}%\n{ipaddr}",
+    "tooltip-format-ethernet": "{ifname} · {ipaddr}",
+    "tooltip-format-disconnected": "Offline",
+    "on-click": "kocmoc-settings --page wifi"
+  },
+  "bluetooth": {
+    "format": "󰂯",
+    "format-off": "󰂲",
+    "format-disabled": "󰂲",
+    "format-connected": "󰂱",
+    "format-no-controller": "",
+    "tooltip-format": "{controller_alias}",
+    "tooltip-format-connected": "{device_enumerate}",
+    "tooltip-format-enumerate-connected": "{device_alias}",
+    "on-click": "kocmoc-settings --page bluetooth"
+  },
+  "pulseaudio": {
+    "format": "{icon}",
+    "format-muted": "󰖁",
+    "format-icons": {
+      "default": [
+        "󰕿",
+        "󰖀",
+        "󰕾"
+      ]
+    },
+    "tooltip-format": "{desc} · {volume}%",
+    "scroll-step": 5,
+    "on-click": "kocmoc-settings --page sound",
+    "on-click-right": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+  },
+  "battery": {
+    "format": "{capacity}%",
+    "format-charging": "󰂄 {capacity}%",
+    "states": {
+      "warning": 20,
+      "critical": 10
+    },
+    "on-click": "kocmoc-settings --page power"
+  },
+  "clock": {
+    "format": "{:%H:%M}",
+    "format-alt": "{:%a %d %b  %H:%M}",
+    "tooltip-format": "<tt>{calendar}</tt>",
+    "calendar": {
+      "mode": "month",
+      "format": {
+        "today": "<b><u>{}</u></b>"
+      }
+    }
+  },
+  "custom/quick": {
+    "format": "󰒓",
+    "on-click": "kocmoc-quick",
+    "tooltip-format": "Quick settings"
+  }
+}

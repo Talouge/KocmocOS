@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Render ~/.cache/kocmoc/labwc from /etc/xdg/kocmoc/labwc + user settings."""
+import sys
+sys.path.insert(0, "/usr/lib/kocmoc")
+from kocmoc import config
+config.render_labwc()

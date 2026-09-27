@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Kocmoc login screen: a greetd client (IPC over $GREETD_SOCK), shown inside cage.
+
+Authentication is done by greetd through PAM; this program never checks
+passwords itself. Without $GREETD_SOCK it runs in a harmless preview mode.
+"""
+import json
+import os
+import pwd
+import socket
+import struct
+import sys
+
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.environ.get("KOCMOC_LIB"), "/usr/lib/kocmoc", os.path.join(_here, "..", "shell")):
+    if _p and os.path.isdir(os.path.join(_p, "kocmoc")):
+        sys.path.insert(0, _p)
+        break
+
+from kocmoc import proc, theme  # noqa: E402
+from kocmoc.theme import GLib, Gtk, button, hbox, label, vbox  # noqa: E402
+
+WALLPAPER = "/usr/share/backgrounds/kocmoc/kocmoc-orbit.png"
+SESSION = ["/usr/bin/kocmoc-session"]
+
+
+class Greetd:
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+
+    def _recv(self, n):
+        data = b""
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("greetd closed the connection")
+            data += chunk
+        return data
+
+    def request(self, obj):
+        payload = json.dumps(obj).encode()
+        self.sock.sendall(struct.pack("=I", len(payload)) + payload)
+        (n,) = struct.unpack("=I", self._recv(4))
+        return json.loads(self._recv(n))
+
+
+def human_users():
+    return sorted((p for p in pwd.getpwall()
+                   if 1000 <= p.pw_uid < 60000 and not p.pw_shell.endswith(("nologin", "false"))),
+                  key=lambda p: p.pw_uid)
+
+
+class Greeter(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="os.kocmoc.Greeter")
+        sock = os.environ.get("GREETD_SOCK")
+        self.greetd = Greetd(sock) if sock else None
+
+    def do_activate(self):
+        theme.apply()
+        win = Gtk.ApplicationWindow(application=self, title="Kocmoc OS")
+        win.add_css_class("greeter")
+        overlay = Gtk.Overlay()
+        if os.path.exists(WALLPAPER):
+            pic = Gtk.Picture.new_for_filename(WALLPAPER)
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            overlay.set_child(pic)
+        else:
+            overlay.set_child(vbox())
+
+        center = vbox(10)
+        center.set_halign(Gtk.Align.CENTER)
+        center.set_valign(Gtk.Align.CENTER)
+        self.clock = label("", "greeter-clock", xalign=0.5)
+        self.date = label("", "greeter-date", xalign=0.5)
+        center.append(self.clock)
+        center.append(self.date)
+
+        card = vbox(12, "greeter-card")
+        card.set_size_request(340, -1)
+        self.users = human_users()
+        names = [u.pw_gecos.split(",")[0] or u.pw_name for u in self.users] or ["(no users)"]
+        self.user_dd = theme.dropdown(names)
+        card.append(self.user_dd)
+        self.pw = Gtk.PasswordEntry(show_peek_icon=True, placeholder_text="Password")
+        self.pw.connect("activate", lambda *_: self.login())
+        card.append(self.pw)
+        self.msg = label("", "error small", xalign=0.5, wrap=True)
+        card.append(self.msg)
+        card.append(button("Sign in", self.login, "suggested"))
+        center.append(card)
+        overlay.add_overlay(center)
+
+        power = hbox(8)
+        power.set_halign(Gtk.Align.END)
+        power.set_valign(Gtk.Align.END)
+        power.set_margin_end(24)
+        power.set_margin_bottom(24)
+        power.append(button("Restart", lambda: proc.spawn(["systemctl", "reboot"]), "flat"))
+        power.append(button("Shut down", lambda: proc.spawn(["systemctl", "poweroff"]), "flat"))
+        overlay.add_overlay(power)
+        brand = label("KOCMOC OS", "greeter-brand")
+        brand.set_halign(Gtk.Align.START)
+        brand.set_valign(Gtk.Align.END)
+        brand.set_margin_start(28)
+        brand.set_margin_bottom(28)
+        overlay.add_overlay(brand)
+
+        win.set_child(overlay)
+        win.fullscreen()
+        win.present()
+        self.tick()
+        GLib.timeout_add_seconds(1, self.tick)
+        self.pw.grab_focus()
+
+    def tick(self):
+        now = GLib.DateTime.new_now_local()
+        self.clock.set_text(now.format("%H:%M"))
+        self.date.set_text(now.format("%A, %d %B"))
+        return True
+
+    def fail(self, text):
+        self.msg.set_text(text)
+        self.pw.set_text("")
+        self.pw.grab_focus()
+        if self.greetd:
+            try:
+                self.greetd.request({"type": "cancel_session"})
+            except Exception:
+                pass
+
+    def login(self):
+        if not self.users:
+            return self.fail("No user accounts exist.")
+        user = self.users[self.user_dd.get_selected()].pw_name
+        password = self.pw.get_text()
+        if self.greetd is None:
+            return self.fail(f"Preview mode: would sign in as {user}.")
+        try:
+            resp = self.greetd.request({"type": "create_session", "username": user})
+            while resp.get("type") == "auth_message":
+                kind = resp.get("auth_message_type")
+                answer = password if kind in ("secret", "visible") else None
+                resp = self.greetd.request({"type": "post_auth_message_response", "response": answer})
+            if resp.get("type") == "success":
+                resp = self.greetd.request({"type": "start_session", "cmd": SESSION, "env": []})
+                if resp.get("type") == "success":
+                    self.quit()
+                    return
+            desc = resp.get("description", "")
+            self.fail("Wrong password." if resp.get("error_type") == "auth_error" else (desc or "Login failed."))
+        except Exception as e:
+            self.fail(f"Login error: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(Greeter().run(sys.argv))

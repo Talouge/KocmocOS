@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Kocmoc quick settings popover (layer-shell). Invoking it again closes it."""
+import os
+import re
+import sys
+
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.environ.get("KOCMOC_LIB"), "/usr/lib/kocmoc", os.path.join(_here, "..", "..", "shell")):
+    if _p and os.path.isdir(os.path.join(_p, "kocmoc")):
+        sys.path.insert(0, _p)
+        break
+
+from kocmoc import net, proc, theme  # noqa: E402
+from kocmoc.theme import Gdk, GLib, Gtk, button, clear, hbox, label, vbox  # noqa: E402
+import gi  # noqa: E402
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LS
+except (ValueError, ImportError):
+    LS = None
+
+
+def wpctl_volume():
+    out = proc.out(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+    m = re.search(r"([\d.]+)", out)
+    return (float(m.group(1)) if m else 0.0), "MUTED" in out
+
+
+def backlight():
+    out = proc.out(["brightnessctl", "-c", "backlight", "-m", "info"]).strip()
+    parts = out.split(",")
+    return int(parts[3].rstrip("%")) if len(parts) >= 4 else None
+
+
+class Quick(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="os.kocmoc.Quick")
+        self.win = None
+
+    def do_activate(self):
+        if self.win:
+            self.win.close()
+            return
+        theme.apply()
+        self.win = Gtk.Window(application=self, title="Quick settings", resizable=False)
+        self.win.set_default_size(360, -1)
+        self.win.add_css_class("quick-window")
+        if LS is not None and LS.is_supported():
+            LS.init_for_window(self.win)
+            LS.set_namespace(self.win, "kocmoc-quick")
+            LS.set_layer(self.win, LS.Layer.OVERLAY)
+            LS.set_anchor(self.win, LS.Edge.BOTTOM, True)
+            LS.set_anchor(self.win, LS.Edge.RIGHT, True)
+            LS.set_margin(self.win, LS.Edge.BOTTOM, 58)
+            LS.set_margin(self.win, LS.Edge.RIGHT, 8)
+            LS.set_keyboard_mode(self.win, LS.KeyboardMode.ON_DEMAND)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, kv, *_: (self.win.close(), True)[1] if kv == Gdk.KEY_Escape else False)
+        self.win.add_controller(keys)
+        self.win.connect("close-request", lambda *_: setattr(self, "win", None) or False)
+        self.root = vbox(14, "quick")
+        self.win.set_child(self.root)
+        self.build()
+        self.win.present()
+
+    def tile(self, title, sub, on, cb):
+        b = Gtk.Button()
+        box = vbox(2)
+        box.append(label(title, "row-title"))
+        box.append(label(sub, "small"))
+        b.set_child(box)
+        b.add_css_class("tile")
+        if on:
+            b.add_css_class("on")
+        b.set_hexpand(True)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def build(self):
+        clear(self.root)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True)
+        wifi_on = net.wifi_enabled()
+        active = next((n["ssid"] for n in net.networks() if n["active"]), None) if wifi_on else None
+        grid.attach(self.tile("Wi-Fi", active or ("On" if wifi_on else "Off"), wifi_on,
+                              lambda: self.act(lambda: net.set_wifi(not wifi_on))), 0, 0, 1, 1)
+        bt = proc.out(["bluetoothctl", "show"])
+        if "Controller" in bt:
+            bt_on = "Powered: yes" in bt
+            grid.attach(self.tile("Bluetooth", "On" if bt_on else "Off", bt_on,
+                                  lambda: self.act(lambda: proc.run(["bluetoothctl", "power", "off" if bt_on else "on"]))), 1, 0, 1, 1)
+        dnd = "do-not-disturb" in proc.out(["makoctl", "mode"])
+        grid.attach(self.tile("Do not disturb", "On" if dnd else "Off", dnd,
+                              lambda: self.act(lambda: proc.run(["makoctl", "mode", "-t", "do-not-disturb"]))), 0, 1, 1, 1)
+        grid.attach(self.tile("Settings", "All options", False,
+                              lambda: (proc.spawn(["kocmoc-settings"]), self.win.close())), 1, 1, 1, 1)
+        self.root.append(grid)
+
+        vol, muted = wpctl_volume()
+        vrow = hbox(10)
+        mute_btn = button("\U000F0581" if muted else "\U000F057E", lambda: self.act(lambda: proc.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])), "icon-btn")
+        vrow.append(mute_btn)
+        vs = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        vs.set_value(round(vol * 100))
+        vs.set_hexpand(True)
+        vs.connect("value-changed", lambda s: proc.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{int(s.get_value())}%"]))
+        vrow.append(vs)
+        self.root.append(vrow)
+
+        br = backlight()
+        if br is not None:
+            brow = hbox(10)
+            brow.append(label("\U000F00DF", "icon-lbl"))
+            bs = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 5, 100, 1)
+            bs.set_value(br)
+            bs.set_hexpand(True)
+            bs.connect("value-changed", lambda s: proc.run(["brightnessctl", "-c", "backlight", "set", f"{int(s.get_value())}%"]))
+            brow.append(bs)
+            self.root.append(brow)
+
+        self.power = hbox(8)
+        self.power.set_halign(Gtk.Align.END)
+        self.power_buttons()
+        self.root.append(self.power)
+
+    def power_buttons(self):
+        clear(self.power)
+        self.power.append(button("Lock", lambda: (self.win.close(), proc.spawn(["kocmoc-lock"]))))
+        self.power.append(button("Log out", lambda: self.ask("Log out", ["labwc", "--exit"])))
+        self.power.append(button("Restart", lambda: self.ask("Restart", ["systemctl", "reboot"])))
+        self.power.append(button("Power off", lambda: self.ask("Power off", ["systemctl", "poweroff"]), "danger"))
+
+    def ask(self, what, cmd):
+        clear(self.power)
+        self.power.append(label(f"{what}?", "row-title"))
+        self.power.append(button("Cancel", self.power_buttons))
+        self.power.append(button(what, lambda: proc.spawn(cmd), "suggested"))
+
+    def act(self, fn):
+        proc.in_thread(fn, lambda _r: GLib.timeout_add(600, lambda: (self.win and self.build(), False)[1]))
+
+
+if __name__ == "__main__":
+    sys.exit(Quick().run(sys.argv))

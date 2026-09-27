@@ -1,0 +1,8 @@
+# Kocmoc OS login screen (greetd + cage + kocmoc-greeter).
+# The live ISO appends an [initial_session] at boot; the installed system never has one.
+[terminal]
+vt = 1
+
+[default_session]
+command = "cage -s -d -- /usr/bin/kocmoc-greeter"
+user = "greeter"

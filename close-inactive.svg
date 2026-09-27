@@ -1,0 +1,6 @@
+#!/bin/sh
+# Greets the user on the live ISO only.
+grep -q archisobasedir /proc/cmdline || exit 0
+sleep 3
+notify-send -a "Kocmoc OS" -i kocmoc-installer "Welcome to Kocmoc OS Live" \
+  "Try everything without touching your disk. Click “Install” on the panel when ready."

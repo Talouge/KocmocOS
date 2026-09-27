@@ -1,0 +1,13 @@
+#!/bin/sh
+# Rewrites /usr/lib/os-release after every 'filesystem' package install/upgrade.
+cat > /usr/lib/os-release <<'REL'
+NAME="Kocmoc OS"
+PRETTY_NAME="Kocmoc OS 0.1"
+ID=kocmoc
+ID_LIKE=arch
+BUILD_ID=rolling
+VERSION_ID=0.1
+ANSI_COLOR="38;2;230;230;230"
+HOME_URL="https://github.com/kocmoc-os/kocmoc-os"
+LOGO=kocmoc-logo
+REL

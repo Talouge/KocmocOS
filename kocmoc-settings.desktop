@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Kocmoc OS installer backend. Runs as root (pkexec). Emits JSON lines:
+  {"progress": 0-100, "stage": "...", "log": "..."}   and   {"error": "..."} on failure.
+
+Strategy: copy the pristine live root filesystem (the squashfs, NOT the running
+overlay) to the target, add the kernel from the ISO, then turn the copy into a
+normal installed Arch system: fstab, locale, users, initramfs, systemd-boot.
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+TARGET = "/mnt/kocmoc-target"
+LOG = "/var/log/kocmoc-installer.log"
+BOOTMNT = "/run/archiso/bootmnt"
+logf = open(LOG, "a")
+
+
+def emit(**ev):
+    print(json.dumps(ev), flush=True)
+    if ev.get("log") or ev.get("stage") or ev.get("error"):
+        logf.write(f"[{time.strftime('%H:%M:%S')}] {ev.get('stage') or ''} {ev.get('log') or ''} {ev.get('error') or ''}\n")
+        logf.flush()
+
+
+class Fail(Exception):
+    pass
+
+
+def run(*cmd, input=None, check=True, quiet=False):
+    emit(log="$ " + " ".join(cmd))
+    p = subprocess.run(cmd, input=input, capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    if out and not quiet:
+        for line in out.splitlines()[-40:]:
+            emit(log=line)
+    if check and p.returncode != 0:
+        raise Fail(f"`{' '.join(cmd[:3])}…` failed (exit {p.returncode}): {out.splitlines()[-1] if out else ''}")
+    return out
+
+
+def chroot(*cmd, **kw):
+    return run("arch-chroot", TARGET, *cmd, **kw)
+
+
+def write(path, text, mode=0o644):
+    full = TARGET + path
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w") as f:
+        f.write(text)
+    os.chmod(full, mode)
+
+
+def validate(c):
+    need = ["disk", "mode", "fs", "locale", "layouts", "timezone", "username", "fullname", "hostname", "password_hash"]
+    missing = [k for k in need if not c.get(k)]
+    if missing:
+        raise Fail("Plan is missing: " + ", ".join(missing))
+    if not re.match(r"^/dev/[A-Za-z0-9/_-]+$", c["disk"]):
+        raise Fail("Invalid disk path")
+    if c["fs"] not in ("ext4", "btrfs") or c["mode"] not in ("erase", "manual"):
+        raise Fail("Invalid file system or mode")
+    if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", c["username"]):
+        raise Fail("Invalid username")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$", c["hostname"]):
+        raise Fail("Invalid hostname")
+    if not re.match(r"^\$6\$[./A-Za-z0-9$]+$", c["password_hash"]):
+        raise Fail("Invalid password hash")
+    if not os.path.exists(f"/usr/share/zoneinfo/{c['timezone']}") or ".." in c["timezone"]:
+        raise Fail("Invalid time zone")
+    if not re.match(r"^[a-z]{2,3}(,[a-z]{2,3}){0,3}$", c["layouts"]):
+        raise Fail("Invalid keyboard layouts")
+    if not re.match(r"^[a-z]{2,3}_[A-Z]{2}\.UTF-8$", c["locale"]):
+        raise Fail("Invalid locale")
+    if not os.path.isdir("/sys/firmware/efi"):
+        raise Fail("This computer was not booted in UEFI mode.")
+    src = run("findmnt", "-no", "SOURCE", BOOTMNT, check=False, quiet=True)
+    if src:
+        pk = run("lsblk", "-no", "PKNAME", src, check=False, quiet=True).strip()
+        if c["disk"] in (src, f"/dev/{pk}"):
+            raise Fail("Refusing to install onto the disk the live system is running from.")
+    for part in (c.get("esp"), c.get("root")):
+        if part and not re.match(r"^/dev/[A-Za-z0-9/_-]+$", part):
+            raise Fail("Invalid partition path")
+
+
+def child_partitions(disk):
+    out = run("lsblk", "-J", "-o", "PATH,TYPE", disk, quiet=True)
+    devs = json.loads(out)["blockdevices"][0].get("children", [])
+    return [d["path"] for d in devs if d["type"] == "part"]
+
+
+def unmount_disk(disk):
+    run("swapoff", "-a", check=False, quiet=True)
+    for mp in sorted(run("lsblk", "-lnpo", "MOUNTPOINTS", disk, check=False, quiet=True).split(), reverse=True):
+        if mp.startswith("/"):
+            run("umount", "-R", mp, check=False)
+
+
+def partition(c):
+    emit(progress=4, stage="Preparing the disk")
+    if os.path.ismount(TARGET):
+        run("umount", "-R", TARGET, check=False)
+    if c["mode"] == "erase":
+        disk = c["disk"]
+        unmount_disk(disk)
+        run("wipefs", "-af", disk)
+        run("sgdisk", "--zap-all", disk)
+        run("sgdisk", "-n", "1:0:+1G", "-t", "1:ef00", "-c", "1:KOCMOC_EFI",
+            "-n", "2:0:0", "-t", "2:8304", "-c", "2:KOCMOC_ROOT", disk)
+        run("partprobe", disk, check=False)
+        run("udevadm", "settle")
+        time.sleep(1)
+        parts = child_partitions(disk)
+        if len(parts) < 2:
+            raise Fail("Partitions did not appear after partitioning.")
+        esp, root, fmt_esp = parts[0], parts[1], True
+    else:
+        esp, root, fmt_esp = c["esp"], c["root"], bool(c.get("format_esp"))
+        for p in (esp, root):
+            if os.path.realpath(p) in open("/proc/mounts").read():
+                run("umount", p, check=False)
+    emit(progress=8, stage="Creating file systems")
+    if fmt_esp:
+        run("mkfs.fat", "-F", "32", "-n", "KOCMOC", esp)
+    if c["fs"] == "ext4":
+        run("mkfs.ext4", "-F", "-L", "kocmoc", root)
+    else:
+        run("mkfs.btrfs", "-f", "-L", "kocmoc", root)
+    return esp, root
+
+
+def mount(c, esp, root):
+    emit(progress=11, stage="Mounting")
+    os.makedirs(TARGET, exist_ok=True)
+    if c["fs"] == "btrfs":
+        run("mount", root, TARGET)
+        for sv in ("@", "@home", "@log", "@pkg"):
+            run("btrfs", "subvolume", "create", f"{TARGET}/{sv}")
+        run("umount", TARGET)
+        opts = "noatime,compress=zstd:1"
+        run("mount", "-o", f"{opts},subvol=@", root, TARGET)
+        for sv, mp in (("@home", "home"), ("@log", "var/log"), ("@pkg", "var/cache/pacman/pkg")):
+            os.makedirs(f"{TARGET}/{mp}", exist_ok=True)
+            run("mount", "-o", f"{opts},subvol={sv}", root, f"{TARGET}/{mp}")
+    else:
+        run("mount", "-o", "noatime", root, TARGET)
+    os.makedirs(f"{TARGET}/boot", exist_ok=True)
+    run("mount", "-o", "fmask=0077,dmask=0077", esp, f"{TARGET}/boot")
+    free = shutil.disk_usage(f"{TARGET}/boot").free
+    if free < 200 * 1024**2:
+        raise Fail(f"Only {free // 1024**2} MB free on the EFI partition; 200 MB+ is required.")
+
+
+def find_source():
+    # archiso mounts the read-only image (without the RAM overlay) here:
+    if os.path.isdir("/run/archiso/airootfs/usr/bin"):
+        return "/run/archiso/airootfs", None
+    images = (glob.glob(f"{BOOTMNT}/*/x86_64/airootfs.sfs") + glob.glob(f"{BOOTMNT}/*/x86_64/airootfs.erofs")
+              + glob.glob("/run/archiso/copytoram/airootfs.*"))
+    if not images:
+        raise Fail("Could not find the Kocmoc OS system image on the live medium.")
+    mp = "/run/kocmoc-src"
+    os.makedirs(mp, exist_ok=True)
+    run("mount", "-o", "loop,ro", images[0], mp)
+    return mp, mp
+
+
+def copy_system():
+    src, own_mount = find_source()
+    emit(progress=14, stage="Copying Kocmoc OS to disk", log=f"source: {src}")
+    cmd = ["rsync", "-aAXH", "--numeric-ids", "--info=progress2", "--no-inc-recursive",
+           "--exclude=/boot/*", f"{src}/", f"{TARGET}/"]
+    emit(log="$ " + " ".join(cmd))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    buf, last = b"", -1
+    for chunk in iter(lambda: p.stdout.read1(4096), b""):
+        buf += chunk
+        parts = re.split(rb"[\r\n]", buf)
+        buf = parts.pop()
+        for line in parts:
+            m = re.search(rb"(\d+)%", line)
+            if m:
+                pct = int(m.group(1))
+                if pct != last:
+                    last = pct
+                    emit(progress=14 + pct * 0.6, stage=f"Copying Kocmoc OS to disk · {pct}%")
+            elif line.strip():
+                emit(log=line.decode(errors="replace"))
+    if p.wait() != 0:
+        raise Fail("Copying the system failed (rsync). Is the disk large enough?")
+    if own_mount:
+        run("umount", own_mount, check=False)
+    kernels = glob.glob(f"{BOOTMNT}/*/boot/x86_64/vmlinuz-linux")
+    if not kernels:
+        raise Fail("Kernel image not found on the live medium.")
+    shutil.copy2(kernels[0], f"{TARGET}/boot/vmlinuz-linux")
+
+
+def strip_live():
+    emit(progress=75, stage="Removing live-session components")
+    for p in ["/etc/systemd/system/kocmoc-live-setup.service",
+              "/etc/systemd/system/multi-user.target.wants/kocmoc-live-setup.service",
+              "/etc/systemd/system/kocmoc-pacman-init.service",
+              "/etc/systemd/system/multi-user.target.wants/kocmoc-pacman-init.service",
+              "/etc/mkinitcpio.conf.d/archiso.conf", "/etc/sudoers.d/kocmoc-live",
+              "/etc/polkit-1/rules.d/49-kocmoc-live.rules",
+              "/usr/share/applications/kocmoc-installer.desktop", "/etc/machine-id"]:
+        full = TARGET + p
+        if os.path.lexists(full):
+            os.remove(full)
+    write("/etc/mkinitcpio.d/linux.preset",
+          'ALL_kver="/boot/vmlinuz-linux"\nPRESETS=(\'default\' \'fallback\')\n'
+          'default_image="/boot/initramfs-linux.img"\nfallback_image="/boot/initramfs-linux-fallback.img"\n'
+          'fallback_options="-S autodetect"\n')
+    # greetd: no autologin on the installed system
+    cfg = open(TARGET + "/etc/greetd/kocmoc.toml").read()
+    cfg = cfg.split("[initial_session]")[0].rstrip() + "\n"
+    write("/etc/greetd/kocmoc.toml", cfg)
+
+
+def configure(c):
+    emit(progress=77, stage="Configuring the system")
+    run("sh", "-c", f"genfstab -U {TARGET} > {TARGET}/etc/fstab")
+    chroot("systemd-machine-id-setup", quiet=True)
+    # locale
+    wanted = {"en_US.UTF-8 UTF-8", f"{c['locale']} UTF-8"}
+    write("/etc/locale.gen", "\n".join(sorted(wanted)) + "\n")
+    chroot("locale-gen")
+    write("/etc/locale.conf", f"LANG={c['locale']}\n")
+    # keyboard
+    layouts = c["layouts"]
+    first = layouts.split(",")[0]
+    console = {"gb": "uk", "ua": "ua", "kz": "kazakh"}.get(first, first)
+    font = "FONT=cyr-sun16\n" if any(l in layouts for l in ("ru", "ua", "kz")) else ""
+    write("/etc/vconsole.conf", f"KEYMAP={console}\n{font}")
+    env = open(TARGET + "/etc/xdg/kocmoc/labwc/environment").read().splitlines()
+    env = [l for l in env if not l.startswith(("XKB_DEFAULT_LAYOUT=", "XKB_DEFAULT_OPTIONS="))]
+    env += [f"XKB_DEFAULT_LAYOUT={layouts}", "XKB_DEFAULT_OPTIONS=grp:alt_shift_toggle"]
+    write("/etc/xdg/kocmoc/labwc/environment", "\n".join(env) + "\n")
+    write("/etc/X11/xorg.conf.d/00-keyboard.conf",
+          'Section "InputClass"\n  Identifier "system-keyboard"\n  MatchIsKeyboard "on"\n'
+          f'  Option "XkbLayout" "{layouts}"\n  Option "XkbOptions" "grp:alt_shift_toggle"\nEndSection\n')
+    greet = open(TARGET + "/etc/greetd/kocmoc.toml").read()
+    greet = greet.replace('command = "cage', f'command = "env XKB_DEFAULT_LAYOUT={first} cage', 1)
+    write("/etc/greetd/kocmoc.toml", greet)
+    # time
+    tz = c["timezone"]
+    target_lt = TARGET + "/etc/localtime"
+    if os.path.lexists(target_lt):
+        os.remove(target_lt)
+    os.symlink(f"/usr/share/zoneinfo/{tz}", target_lt)
+    chroot("hwclock", "--systohc", check=False)
+    # network identity
+    write("/etc/hostname", c["hostname"] + "\n")
+    write("/etc/hosts", f"127.0.0.1 localhost\n::1 localhost\n127.0.1.1 {c['hostname']}.localdomain {c['hostname']}\n")
+    # users & security
+    emit(progress=81, stage="Creating your account")
+    chroot("useradd", "-m", "-G", "wheel", "-s", "/bin/bash", "-c", c["fullname"], c["username"])
+    chroot("usermod", "-p", c["password_hash"], c["username"])
+    chroot("passwd", "-l", "root")
+    write("/etc/sudoers.d/10-kocmoc-wheel", "%wheel ALL=(ALL:ALL) ALL\n", 0o440)
+    home = f"{TARGET}/home/{c['username']}/.config/kocmoc"
+    os.makedirs(home, exist_ok=True)
+    with open(f"{home}/settings.json", "w") as f:
+        json.dump({"keyboard": {"layouts": layouts}}, f)
+    chroot("chown", "-R", f"{c['username']}:{c['username']}", f"/home/{c['username']}")
+    emit(progress=83, stage="Setting up package keys")
+    chroot("pacman-key", "--init", quiet=True)
+    chroot("pacman-key", "--populate", "archlinux", quiet=True)
+
+
+def boot(c, root):
+    emit(progress=86, stage="Building the initramfs")
+    conf = open(TARGET + "/etc/mkinitcpio.conf").read()
+    if "plymouth" not in re.search(r"^HOOKS=\((.*)\)", conf, re.M).group(1):
+        conf = re.sub(r"^(HOOKS=\(.*?\budev\b)", r"\1 plymouth", conf, count=1, flags=re.M)
+    write("/etc/mkinitcpio.conf", conf)
+    chroot("mkinitcpio", "-P")
+    emit(progress=94, stage="Installing the boot loader")
+    try:
+        chroot("bootctl", "install", "--esp-path=/boot")
+    except Fail:
+        emit(log="EFI variables not writable; installing to the fallback path only.")
+        chroot("bootctl", "install", "--esp-path=/boot", "--no-variables")
+    uuid = run("blkid", "-s", "UUID", "-o", "value", root, quiet=True).strip()
+    flags = " rootflags=subvol=@" if c["fs"] == "btrfs" else ""
+    opts = f"root=UUID={uuid} rw{flags} quiet splash loglevel=3"
+    write("/boot/loader/loader.conf", "default kocmoc.conf\ntimeout 3\nconsole-mode max\neditor no\n")
+    write("/boot/loader/entries/kocmoc.conf",
+          f"title   Kocmoc OS\nlinux   /vmlinuz-linux\ninitrd  /initramfs-linux.img\noptions {opts}\n")
+    write("/boot/loader/entries/kocmoc-fallback.conf",
+          f"title   Kocmoc OS (fallback initramfs)\nlinux   /vmlinuz-linux\ninitrd  /initramfs-linux-fallback.img\noptions root=UUID={uuid} rw{flags}\n")
+    chroot("systemctl", "enable", "systemd-boot-update.service", check=False)
+
+
+def main():
+    if os.geteuid() != 0:
+        emit(error="The installer backend must run as root.")
+        sys.exit(1)
+    try:
+        with open(sys.argv[1]) as f:
+            c = json.load(f)
+        emit(progress=1, stage="Checking the plan")
+        validate(c)
+        esp, root = partition(c)
+        mount(c, esp, root)
+        copy_system()
+        strip_live()
+        configure(c)
+        boot(c, root)
+        emit(progress=98, stage="Finishing")
+        run("sync")
+        logf.flush()
+        shutil.copy(LOG, f"{TARGET}/var/log/kocmoc-installer.log")
+        run("umount", "-R", TARGET, check=False)
+        emit(progress=100, stage="Done")
+    except Fail as e:
+        emit(error=str(e))
+        subprocess.run(["umount", "-R", TARGET], capture_output=True)
+        sys.exit(1)
+    except Exception as e:  # unexpected: still report cleanly
+        emit(error=f"Unexpected error: {e!r}")
+        subprocess.run(["umount", "-R", TARGET], capture_output=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

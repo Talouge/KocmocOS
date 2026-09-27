@@ -1,0 +1,29 @@
+# Kocmoc terminal defaults
+[main]
+font=JetBrains Mono:size=11
+pad=14x12
+[scrollback]
+lines=10000
+[cursor]
+style=beam
+blink=yes
+[colors]
+alpha=0.96
+background=0b0b0b
+foreground=d9d9d9
+regular0=1c1c1c
+regular1=d77b7b
+regular2=9fc99f
+regular3=d9c38c
+regular4=8fa8c9
+regular5=b99bc9
+regular6=8cc4c4
+regular7=c8c8c8
+bright0=4a4a4a
+bright1=e89a9a
+bright2=b5dbb5
+bright3=e8d6a8
+bright4=a9bfdb
+bright5=cdb5db
+bright6=a8d9d9
+bright7=ffffff

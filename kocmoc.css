@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Start the Kocmoc panel (waybar) with the user's clock format applied."""
+import json, os, sys
+sys.path.insert(0, "/usr/lib/kocmoc")
+from kocmoc import config
+SYS = "/etc/xdg/kocmoc/waybar"
+cfg = json.load(open(os.path.join(SYS, "config.json")))
+if not config.load()["clock"]["24h"]:
+    cfg["clock"]["format"] = "{:%I:%M %p}"
+    cfg["clock"]["format-alt"] = "{:%a %d %b  %I:%M %p}"
+os.makedirs(config.CACHE_DIR, exist_ok=True)
+path = os.path.join(config.CACHE_DIR, "waybar.json")
+with open(path, "w") as f:
+    json.dump(cfg, f)
+os.execvp("waybar", ["waybar", "-c", path, "-s", os.path.join(SYS, "style.css")])

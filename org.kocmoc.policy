@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""Kocmoc OS graphical installer (front-end).
+
+Collects choices in 12 steps and hands a JSON plan to kocmoc-install-backend,
+which runs as root through pkexec and streams real progress as JSON lines.
+The password never leaves this process in clear text: it is hashed with
+`openssl passwd -6` (SHA-512 crypt) before being written to the plan.
+"""
+import json
+import os
+import re
+import sys
+import tempfile
+
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.environ.get("KOCMOC_LIB"), "/usr/lib/kocmoc", os.path.join(_here, "..", "shell")):
+    if _p and os.path.isdir(os.path.join(_p, "kocmoc")):
+        sys.path.insert(0, _p)
+        break
+
+from kocmoc import config, disks, net, proc, theme  # noqa: E402
+from kocmoc.theme import GLib, Gtk, button, clear, dropdown, hbox, label, row, vbox  # noqa: E402
+
+BACKEND = os.environ.get("KOCMOC_INSTALL_BACKEND", "/usr/lib/kocmoc/kocmoc-install-backend")
+LANGS = [("English", "en_US.UTF-8"), ("Русский", "ru_RU.UTF-8"), ("Українська", "uk_UA.UTF-8"),
+         ("Deutsch", "de_DE.UTF-8"), ("Français", "fr_FR.UTF-8"), ("Español", "es_ES.UTF-8"),
+         ("Italiano", "it_IT.UTF-8"), ("Português (Brasil)", "pt_BR.UTF-8"), ("Polski", "pl_PL.UTF-8"),
+         ("Türkçe", "tr_TR.UTF-8"), ("Қазақ тілі", "kk_KZ.UTF-8"), ("中文 (简体)", "zh_CN.UTF-8"),
+         ("日本語", "ja_JP.UTF-8")]
+KEYMAPS = [("English (US)", "us"), ("English (UK)", "gb"), ("Russian", "ru"), ("Ukrainian", "ua"),
+           ("Kazakh", "kz"), ("German", "de"), ("French", "fr"), ("Spanish", "es"), ("Italian", "it"),
+           ("Portuguese (Brazil)", "br"), ("Polish", "pl"), ("Turkish", "tr"), ("Japanese", "jp")]
+STEPS = ["Welcome", "Language", "Keyboard", "Internet", "Disk", "Partitioning", "User", "Password",
+         "Time zone", "Summary", "Installing", "Done"]
+
+
+class Installer(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Install Kocmoc OS")
+        self.set_default_size(980, 660)
+        self.cfg = {"locale": "en_US.UTF-8", "layouts": "us", "disk": None, "mode": "erase", "fs": "ext4",
+                    "esp": None, "format_esp": False, "root": None, "fullname": "", "username": "",
+                    "hostname": "kocmoc", "timezone": "UTC"}
+        self.step = 0
+        self.installing = False
+        header = Gtk.HeaderBar()
+        header.set_title_widget(label("Install Kocmoc OS", "title", xalign=0.5))
+        self.set_titlebar(header)
+
+        root = hbox(0)
+        side = vbox(2, "sidebar steps")
+        side.set_size_request(210, -1)
+        self.step_labels = []
+        for i, s in enumerate(STEPS):
+            lb = label(f"{i + 1:>2}   {s}", "step")
+            self.step_labels.append(lb)
+            side.append(lb)
+        root.append(side)
+        main = vbox(0)
+        main.set_hexpand(True)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT, transition_duration=220, vexpand=True)
+        main.append(self.stack)
+        nav = hbox(8, "navbar")
+        self.err = label("", "error small", wrap=True)
+        self.err.set_hexpand(True)
+        nav.append(self.err)
+        self.back_btn = button("Back", self.back)
+        self.next_btn = button("Continue", self.next, "suggested")
+        nav.append(self.back_btn)
+        nav.append(self.next_btn)
+        main.append(nav)
+        root.append(main)
+        self.set_child(root)
+
+        self.builders = [self.p_welcome, self.p_language, self.p_keyboard, self.p_internet, self.p_disk,
+                         self.p_partition, self.p_user, self.p_password, self.p_timezone, self.p_summary,
+                         self.p_install, self.p_done]
+        self.validators = {4: self.v_disk, 5: self.v_partition, 6: self.v_user, 7: self.v_password}
+        self.go(0)
+
+    # ------------------------------------------------------------ navigation
+    def go(self, i):
+        self.step = i
+        self.err.set_text("")
+        for j, lb in enumerate(self.step_labels):
+            for c in ("current", "done"):
+                lb.remove_css_class(c)
+            if j == i:
+                lb.add_css_class("current")
+            elif j < i:
+                lb.add_css_class("done")
+        name = f"s{i}"
+        old = self.stack.get_child_by_name(name)
+        if old:
+            self.stack.remove(old)
+        outer, body = theme.page(STEPS[i])
+        self.builders[i](body)
+        self.stack.add_named(outer, name)
+        self.stack.set_visible_child_name(name)
+        self.back_btn.set_visible(0 < i < 10)
+        self.next_btn.set_visible(i < 10)
+        self.next_btn.set_label("Install" if i == 9 else "Continue")
+        if i == 9:
+            self.next_btn.set_sensitive(False)
+        elif i == 0:
+            self.next_btn.set_sensitive(disks.uefi())
+        else:
+            self.next_btn.set_sensitive(True)
+
+    def next(self):
+        v = self.validators.get(self.step)
+        problem = v() if v else None
+        if problem:
+            self.err.set_text(problem)
+            return
+        self.go(self.step + 1)
+
+    def back(self):
+        if self.step > 0 and not self.installing:
+            self.go(self.step - 1)
+
+    # ------------------------------------------------------------ pages
+    def p_welcome(self, b):
+        lp = theme.logo_path()
+        if lp:
+            img = Gtk.Image.new_from_file(lp)
+            img.set_pixel_size(120)
+            b.append(img)
+        b.append(label("Welcome to Kocmoc OS", "hero-title", xalign=0.5))
+        b.append(label("A calm, minimal desktop on a rolling Arch Linux base. This wizard installs the "
+                       "exact system you are running now onto your disk. It takes about 5–10 minutes.", "dim", xalign=0.5, wrap=True))
+        g, card = theme.group("System check")
+        mem = next((int(l.split()[1]) // 1024 for l in open("/proc/meminfo") if l.startswith("MemTotal")), 0)
+        card.append(row("UEFI firmware", "Required. In VirtualBox: Settings → System → Enable EFI.",
+                        label("OK" if disks.uefi() else "Missing", "badge ok" if disks.uefi() else "badge")))
+        card.append(row("Memory", "2 GB minimum, 4 GB recommended", label(f"{mem} MB", "badge ok" if mem >= 1900 else "badge")))
+        n = len([d for d in disks.install_targets() if not d["too_small"]])
+        card.append(row("Disks with 20 GB+", None, label(str(n), "badge ok" if n else "badge")))
+        b.append(g)
+
+    def p_language(self, b):
+        b.append(label("Language for the installed system (menus follow it where apps are translated).", "dim", wrap=True))
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        lb.add_css_class("card")
+        for name, loc in LANGS:
+            r = Gtk.ListBoxRow()
+            r.set_child(row(name, loc))
+            r.val = loc
+            lb.append(r)
+            if loc == self.cfg["locale"]:
+                lb.select_row(r)
+        lb.connect("row-selected", lambda _l, r: r and self.cfg.update(locale=r.val))
+        b.append(lb)
+
+    def p_keyboard(self, b):
+        codes = [c for _, c in KEYMAPS]
+        cur = self.cfg["layouts"].split(",")
+        g, card = theme.group("Layouts")
+        primary = dropdown([n for n, _ in KEYMAPS], codes.index(cur[0]) if cur[0] in codes else 0)
+        sec_opts = ["None"] + [n for n, _ in KEYMAPS]
+        secondary = dropdown(sec_opts, codes.index(cur[1]) + 1 if len(cur) > 1 and cur[1] in codes else 0)
+        card.append(row("Main layout", None, primary))
+        card.append(row("Second layout", "Switch with Alt + Shift", secondary))
+        test = Gtk.Entry(placeholder_text="Type here to test")
+        card.append(row("Test", None, test))
+        b.append(g)
+
+        def changed(*_):
+            lay = [codes[primary.get_selected()]]
+            if secondary.get_selected() > 0 and codes[secondary.get_selected() - 1] not in lay:
+                lay.append(codes[secondary.get_selected() - 1])
+            self.cfg["layouts"] = ",".join(lay)
+            s = config.load()                       # apply to this live session too
+            s["keyboard"]["layouts"] = self.cfg["layouts"]
+            config.save(s)
+            config.apply_labwc(s)
+        primary.connect("notify::selected", changed)
+        secondary.connect("notify::selected", changed)
+
+    def p_internet(self, b):
+        b.append(label("Internet is optional: Kocmoc OS installs completely offline from this USB/ISO. "
+                       "Connect now if you want to update right after installing.", "dim", wrap=True))
+        status = label("Checking…", "badge")
+        g, card = theme.group(None)
+        card.append(row("Connection", None, status))
+        b.append(g)
+        listbox = vbox(0, "card")
+        b.append(listbox)
+
+        def show(res):
+            conn, nets, dev = res if not isinstance(res, Exception) else ("unknown", [], None)
+            status.set_text({"full": "Connected", "none": "Offline", "limited": "Limited"}.get(conn, conn))
+            clear(listbox)
+            if not dev:
+                listbox.append(row("No Wi-Fi adapter", "Use a cable, or continue offline."))
+                return
+            for n in nets[:12]:
+                if n["active"]:
+                    listbox.append(row(n["ssid"], "Connected", label("✓", "dim")))
+                    continue
+
+                def connect(n=n):
+                    def go(pw):
+                        status.set_text("Connecting…")
+                        proc.in_thread(lambda: net.connect(n["ssid"], n["security"], pw),
+                                       lambda e: (self.err.set_text(f"Wi-Fi: {e}" if e else ""), refresh()))
+                    if n["security"]:
+                        theme.form(self, f"Connect to “{n['ssid']}”", [("pw", "Password", "secret")], "Connect",
+                                   lambda v: go(v["pw"]))
+                    else:
+                        go(None)
+                listbox.append(row(n["ssid"], f"{n['signal']}% · {n['security'] or 'Open'}", button("Connect", connect)))
+
+        def refresh():
+            proc.in_thread(lambda: (net.connectivity(), net.networks(True), net.wifi_device()), show)
+        refresh()
+
+    def p_disk(self, b):
+        b.append(label("Choose the disk to install Kocmoc OS on.", "dim", wrap=True))
+        targets = disks.install_targets()
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        lb.add_css_class("card")
+        for d in targets:
+            r = Gtk.ListBoxRow()
+            parts = len(d.get("children") or [])
+            sub = f"{d['path']} · {d.get('tran') or 'disk'} · {parts} partition(s)" + (" · too small (needs 20 GB)" if d["too_small"] else "")
+            r.set_child(row(d.get("model") or d["name"], sub, label(disks.human(d["size"]), "badge")))
+            r.val = d
+            r.set_sensitive(not d["too_small"])
+            lb.append(r)
+            if self.cfg["disk"] == d["path"]:
+                lb.select_row(r)
+        lb.connect("row-selected", lambda _l, r: r and self.cfg.update(disk=r.val["path"], esp=None, root=None))
+        b.append(lb)
+        if not targets:
+            b.append(label("No usable disks found. In a VM, add a virtual disk of at least 20 GB.", "error", wrap=True))
+        b.append(button("Refresh", lambda: self.go(4), "flat"))
+
+    def v_disk(self):
+        return None if self.cfg["disk"] else "Select a disk first."
+
+    def p_partition(self, b):
+        disk = self.cfg["disk"]
+        erase = Gtk.CheckButton(label=f"Erase {disk} and install Kocmoc OS (recommended)")
+        manual = Gtk.CheckButton(label="Use existing partitions (dual boot / advanced)")
+        manual.set_group(erase)
+        (erase if self.cfg["mode"] == "erase" else manual).set_active(True)
+        b.append(erase)
+        g, card = theme.group(None)
+        fs_opts = ["ext4", "btrfs"]
+        fs = dropdown(["ext4 · simple and proven", "btrfs · compression, subvolumes"], fs_opts.index(self.cfg["fs"]))
+        fs.connect("notify::selected", lambda w: self.cfg.update(fs=fs_opts[w.get_selected()]))
+        card.append(row("File system", "Layout: 1 GB EFI system partition + root. Swap uses compressed RAM (zram).", fs))
+        b.append(g)
+        b.append(manual)
+        man = vbox(8)
+        parts = disks.partitions(disk)
+        pnames = ["–"] + [f"{p['path']} · {disks.human(p.get('size'))} · {p.get('fstype') or 'empty'} {p.get('label') or ''}" for p in parts]
+        pval = [None] + [p["path"] for p in parts]
+        esp_guess = next((i + 1 for i, p in enumerate(parts) if disks.is_esp(p)), 0)
+        g2, card2 = theme.group(None)
+        esp_dd = dropdown(pnames, pval.index(self.cfg["esp"]) if self.cfg["esp"] in pval else esp_guess)
+        root_dd = dropdown(pnames, pval.index(self.cfg["root"]) if self.cfg["root"] in pval else 0)
+        fmt = Gtk.CheckButton(label="Format", active=self.cfg["format_esp"])
+        ebox = hbox(8)
+        ebox.append(esp_dd)
+        ebox.append(fmt)
+        card2.append(row("EFI system partition → /boot", "At least 300 MB. Keep unformatted to preserve other systems' boot loaders.", ebox))
+        card2.append(row("Root partition → /", "Will be formatted with the file system chosen above. 20 GB+.", root_dd))
+        tools = hbox(8)
+        if proc.which("gparted"):
+            tools.append(button("Open partition editor", lambda: proc.spawn(["gparted", disk])))
+        tools.append(button("Reload partitions", lambda: self.go(5), "flat"))
+        card2.append(row("Need to create or resize partitions?", None, tools))
+        man.append(g2)
+        b.append(man)
+
+        def sync(*_):
+            self.cfg["mode"] = "erase" if erase.get_active() else "manual"
+            man.set_sensitive(not erase.get_active())
+            self.cfg["esp"] = pval[esp_dd.get_selected()]
+            self.cfg["root"] = pval[root_dd.get_selected()]
+            self.cfg["format_esp"] = fmt.get_active()
+        for w, sig in ((erase, "toggled"), (esp_dd, "notify::selected"), (root_dd, "notify::selected"), (fmt, "toggled")):
+            w.connect(sig, sync)
+        sync()
+
+    def v_partition(self):
+        if self.cfg["mode"] == "erase":
+            return None
+        parts = {p["path"]: p for p in disks.partitions(self.cfg["disk"])}
+        esp, root = parts.get(self.cfg["esp"]), parts.get(self.cfg["root"])
+        if not esp or not root:
+            return "Pick both an EFI system partition and a root partition."
+        if esp["path"] == root["path"]:
+            return "EFI and root must be different partitions."
+        if int(esp.get("size") or 0) < 300 * 1024**2:
+            return "The EFI partition is smaller than 300 MB: not enough for kernel + initramfs."
+        if not self.cfg["format_esp"] and esp.get("fstype") != "vfat":
+            return "The EFI partition isn't FAT32. Tick “Format”."
+        if int(root.get("size") or 0) < 20 * 1024**3:
+            return "The root partition needs at least 20 GB."
+        return None
+
+    def p_user(self, b):
+        g, card = theme.group(None)
+        self.e_full = Gtk.Entry(text=self.cfg["fullname"], placeholder_text="Ada Lovelace")
+        self.e_user = Gtk.Entry(text=self.cfg["username"], placeholder_text="ada")
+        self.e_host = Gtk.Entry(text=self.cfg["hostname"])
+        card.append(row("Your name", None, self.e_full))
+        card.append(row("Username", "lowercase letters, digits, - and _", self.e_user))
+        card.append(row("Computer name", None, self.e_host))
+        b.append(g)
+
+        def suggest(*_):
+            if not self.cfg.get("_user_typed"):
+                u = re.sub(r"[^a-z0-9_-]", "", self.e_full.get_text().lower().split(" ")[0])[:32]
+                self.e_user.set_text(u)
+        self.e_full.connect("changed", suggest)
+        self.e_user.connect("changed", lambda e: self.cfg.update(_user_typed=e.has_focus()) if e.has_focus() else None)
+        b.append(label("This account is an administrator (member of wheel: uses sudo / polkit). "
+                       "The root account stays locked.", "dim small", wrap=True))
+
+    def v_user(self):
+        full, user, host = self.e_full.get_text().strip(), self.e_user.get_text().strip(), self.e_host.get_text().strip()
+        if not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", user):
+            return "Username must start with a letter and use only a-z, 0-9, - or _."
+        if user in ("root", "live", "greeter", "bin", "daemon", "nobody", "http", "dbus"):
+            return "That username is reserved."
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$", host):
+            return "Computer name: letters, digits and hyphens only."
+        if any(c in full for c in ":,\n"):
+            return "Your name can't contain ':' or ','."
+        self.cfg.update(fullname=full or user, username=user, hostname=host)
+        return None
+
+    def p_password(self, b):
+        g, card = theme.group(None)
+        self.e_pw = Gtk.PasswordEntry(show_peek_icon=True)
+        self.e_pw2 = Gtk.PasswordEntry(show_peek_icon=True)
+        card.append(row("Password", None, self.e_pw))
+        card.append(row("Confirm", None, self.e_pw2))
+        b.append(g)
+        self.strength = label("", "dim small")
+        b.append(self.strength)
+
+        def rate(*_):
+            p = self.e_pw.get_text()
+            score = sum([len(p) >= 8, len(p) >= 12, bool(re.search(r"[A-Z]", p)) and bool(re.search(r"[a-z]", p)),
+                         bool(re.search(r"\d", p)), bool(re.search(r"[^A-Za-z0-9]", p))])
+            self.strength.set_text("Strength: " + ["very weak", "weak", "fair", "good", "strong", "excellent"][score] if p else "")
+        self.e_pw.connect("changed", rate)
+
+    def v_password(self):
+        p, p2 = self.e_pw.get_text(), self.e_pw2.get_text()
+        if len(p) < 6:
+            return "Use at least 6 characters."
+        if p != p2:
+            return "Passwords don't match."
+        rc, out = proc.run(["openssl", "passwd", "-6", "-stdin"], input=p + "\n")
+        if rc != 0 or not out.startswith("$6$"):
+            return "Could not hash the password (openssl)."
+        self.cfg["password_hash"] = out.strip()
+        return None
+
+    def p_timezone(self, b):
+        zones = proc.out(["timedatectl", "list-timezones"]).split() or ["UTC"]
+        search = Gtk.SearchEntry(placeholder_text="Search city or region, e.g. Moscow")
+        b.append(search)
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        lb.add_css_class("card")
+        sw = Gtk.ScrolledWindow(vexpand=True, min_content_height=320)
+        sw.set_child(lb)
+        b.append(sw)
+        for z in zones:
+            r = Gtk.ListBoxRow()
+            r.set_child(label(z, "pad-s"))
+            r.val = z
+            lb.append(r)
+            if z == self.cfg["timezone"]:
+                lb.select_row(r)
+        lb.set_filter_func(lambda r: search.get_text().lower().replace(" ", "_") in r.val.lower())
+        search.connect("search-changed", lambda *_: lb.invalidate_filter())
+        lb.connect("row-selected", lambda _l, r: r and self.cfg.update(timezone=r.val))
+
+    def p_summary(self, b):
+        c = self.cfg
+        g, card = theme.group("Review")
+        lang = next((n for n, l in LANGS if l == c["locale"]), c["locale"])
+        items = [("Language", lang), ("Keyboard", c["layouts"]), ("Time zone", c["timezone"]),
+                 ("User", f"{c['fullname']} ({c['username']}), administrator"), ("Computer name", c["hostname"])]
+        if c["mode"] == "erase":
+            items.append(("Disk", f"{c['disk']}: ERASE everything → 1 GB EFI + {c['fs']} root"))
+        else:
+            items.append(("Partitions", f"EFI {c['esp']} ({'format' if c['format_esp'] else 'keep'}), root {c['root']} → format {c['fs']}"))
+        items.append(("Boot loader", "systemd-boot (UEFI)"))
+        for k, v in items:
+            card.append(row(k, None, label(v, "dim", wrap=True)))
+        b.append(g)
+        warn = label(("All data on " + c["disk"] + " will be permanently erased.") if c["mode"] == "erase"
+                     else f"All data on {c['root']} will be permanently erased.", "warn", wrap=True)
+        b.append(warn)
+        ok = Gtk.CheckButton(label="I understand, and I have backed up anything I need.")
+        ok.connect("toggled", lambda w: self.next_btn.set_sensitive(w.get_active()))
+        b.append(ok)
+
+    def p_install(self, b):
+        self.installing = True
+        self.stage = label("Starting…", "section-title", wrap=True)
+        self.bar = Gtk.ProgressBar(show_text=True)
+        b.append(self.stage)
+        b.append(self.bar)
+        self.logbuf = Gtk.TextBuffer()
+        tv = Gtk.TextView(buffer=self.logbuf, editable=False, monospace=True, wrap_mode=Gtk.WrapMode.CHAR)
+        sw = Gtk.ScrolledWindow(vexpand=True, min_content_height=260)
+        sw.set_child(tv)
+        exp = Gtk.Expander(label="Details", expanded=False)
+        exp.set_child(sw)
+        b.append(exp)
+        self.result = None
+        plan = {k: v for k, v in self.cfg.items() if not k.startswith("_")}
+        fd, path = tempfile.mkstemp(prefix="kocmoc-plan-", suffix=".json", dir=os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+        with os.fdopen(fd, "w") as f:
+            json.dump(plan, f)
+        os.chmod(path, 0o600)
+        self.plan_path = path
+        proc.stream(["pkexec", BACKEND, path], self.on_line, self.on_done)
+
+    def on_line(self, line):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            self.logbuf.insert(self.logbuf.get_end_iter(), line + "\n")
+            return
+        if "progress" in ev:
+            self.bar.set_fraction(min(1.0, ev["progress"] / 100))
+        if ev.get("stage"):
+            self.stage.set_text(ev["stage"])
+        if ev.get("log"):
+            self.logbuf.insert(self.logbuf.get_end_iter(), ev["log"] + "\n")
+        if ev.get("error"):
+            self.result = ev["error"]
+
+    def on_done(self, rc):
+        try:
+            os.remove(self.plan_path)
+        except OSError:
+            pass
+        self.installing = False
+        if rc != 0 and not self.result:
+            self.result = {126: "Authentication was cancelled."}.get(rc, f"Installer backend exited with code {rc}.")
+        self.go(11) if rc == 0 and not self.result else self.show_failure()
+
+    def show_failure(self):
+        self.stage.set_text("Installation failed")
+        self.bar.add_css_class("failed")
+        box = vbox(8)
+        box.append(label(self.result or "Unknown error", "error", wrap=True))
+        box.append(label("Full log: /var/log/kocmoc-installer.log. Nothing was written to the boot order if the "
+                         "failure happened before the boot loader step.", "dim small", wrap=True))
+        box.append(button("Back to summary", lambda: self.go(9)))
+        self.stack.get_visible_child().get_child().get_child().append(box)
+
+    def p_done(self, b):
+        lp = theme.logo_path()
+        if lp:
+            img = Gtk.Image.new_from_file(lp)
+            img.set_pixel_size(96)
+            b.append(img)
+        b.append(label("Kocmoc OS is installed", "hero-title", xalign=0.5))
+        b.append(label("Remove the installation medium (in VirtualBox: Devices → Optical Drives → Remove disk), "
+                       "then restart. Sign in with the account you just created.", "dim", xalign=0.5, wrap=True))
+        bb = hbox(8)
+        bb.set_halign(Gtk.Align.CENTER)
+        bb.append(button("Keep exploring", self.close))
+        bb.append(button("Restart now", lambda: proc.spawn(["systemctl", "reboot"]), "suggested"))
+        b.append(bb)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="os.kocmoc.Installer")
+
+    def do_activate(self):
+        if not self.get_active_window():
+            theme.apply()
+            Installer(self)
+        self.get_active_window().present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

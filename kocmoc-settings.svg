@@ -1,0 +1,2 @@
+"""Shared library for Kocmoc OS system applications."""
+VERSION = "0.1.0"

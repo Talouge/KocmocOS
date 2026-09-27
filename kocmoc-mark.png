@@ -1,0 +1,72 @@
+"""Block device discovery for the installer and Settings > Storage."""
+import json
+import os
+import subprocess
+
+
+def lsblk():
+    try:
+        out = subprocess.run(
+            ["lsblk", "-J", "-b", "-e", "7,11", "-o",
+             "NAME,PATH,SIZE,TYPE,MODEL,TRAN,RM,RO,FSTYPE,LABEL,PARTTYPE,PARTLABEL,MOUNTPOINTS,PKNAME"],
+            capture_output=True, text=True, timeout=15).stdout
+        return json.loads(out).get("blockdevices", [])
+    except Exception:
+        return []
+
+
+def live_boot_disk():
+    """The disk holding the running live medium (never offered as a target)."""
+    try:
+        src = subprocess.run(["findmnt", "-no", "SOURCE", "/run/archiso/bootmnt"],
+                             capture_output=True, text=True).stdout.strip()
+        if not src:
+            return None
+        pk = subprocess.run(["lsblk", "-no", "PKNAME", src], capture_output=True, text=True).stdout.strip()
+        return "/dev/" + pk if pk else src
+    except Exception:
+        return None
+
+
+def install_targets(min_bytes=20 * 1024**3):
+    live = live_boot_disk()
+    res = []
+    for d in lsblk():
+        if d.get("type") != "disk" or d.get("ro") or d.get("path") == live:
+            continue
+        if d["name"].startswith(("zram", "loop", "sr")):
+            continue
+        d["too_small"] = int(d.get("size") or 0) < min_bytes
+        res.append(d)
+    return res
+
+
+def partitions(disk_path=None):
+    res = []
+    for d in lsblk():
+        if disk_path and d.get("path") != disk_path:
+            continue
+        for c in d.get("children", []) or []:
+            if c.get("type") == "part":
+                c["disk"] = d["path"]
+                res.append(c)
+    return res
+
+
+ESP_GUID = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+
+
+def is_esp(part):
+    return (part.get("parttype") or "").lower() == ESP_GUID
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def uefi():
+    return os.path.isdir("/sys/firmware/efi")

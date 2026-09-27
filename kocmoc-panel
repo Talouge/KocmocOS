@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Kocmoc
+Comment=Kocmoc OS desktop
+Exec=/usr/bin/kocmoc-session
+Type=Application
+DesktopNames=Kocmoc;wlroots

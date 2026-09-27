@@ -1,0 +1,19 @@
+#!/bin/bash
+# Runs ONLY on the live ISO (ConditionKernelCommandLine=archisobasedir).
+# Everything live-specific is created at runtime so the squashfs image that
+# the installer copies to disk stays clean.
+set -euo pipefail
+if ! id live &>/dev/null; then
+  useradd -m -G wheel -s /bin/bash -c "Kocmoc Live" live
+fi
+echo 'live:live' | chpasswd
+# Passwordless admin for the throw-away live session only.
+install -m 0440 /dev/stdin /etc/sudoers.d/kocmoc-live <<<'live ALL=(ALL:ALL) NOPASSWD: ALL'
+install -m 0644 /dev/stdin /etc/polkit-1/rules.d/49-kocmoc-live.rules <<'RULE'
+polkit.addRule(function (action, subject) {
+  if (subject.user == "live") { return polkit.Result.YES; }
+});
+RULE
+if ! grep -q '^\[initial_session\]' /etc/greetd/kocmoc.toml; then
+  printf '\n[initial_session]\ncommand = "/usr/bin/kocmoc-session"\nuser = "live"\n' >> /etc/greetd/kocmoc.toml
+fi
